@@ -1,0 +1,59 @@
+FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu20.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ENV TZ=America/San_Francisco
+ENV PYTHONUNBUFFERED 1
+ENV PIP_DISABLE_PIP_VERSION_CHECK 1
+ENV PIP_NO_CACHE_DIR 1
+RUN apt-get update && apt-get install -y \
+  ffmpeg git python3-pip vim libglew-dev \
+  x11-xserver-utils xvfb curl pkg-config \
+  libhdf5-dev libfreetype6-dev zip \
+  libsdl1.2-dev libsdl-image1.2-dev libsdl-ttf2.0-dev \
+  libsdl-mixer1.2-dev libportmidi-dev \
+  && apt-get clean
+
+RUN apt install -y python3-dev libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev libsdl2-ttf-dev
+
+# Install conda & setup conda
+RUN curl -L -o ~/miniconda.sh -O https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh 
+RUN chmod +x ~/miniconda.sh && \
+    ~/miniconda.sh -b -p /opt/conda && \
+    rm ~/miniconda.sh 
+RUN /opt/conda/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+RUN /opt/conda/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+RUN /opt/conda/bin/conda install -y numpy scipy ipython mkl mkl-include && \
+    /opt/conda/bin/conda clean -ya
+ENV PATH /opt/conda/bin:$PATH
+
+RUN conda create -n verl-agent-311 python==3.11 -y
+
+SHELL ["conda", "run", "-n", "verl-agent-311", "/bin/bash", "-c"]
+RUN echo "Current conda environment:"
+RUN conda info --envs | grep '*' || echo "No environment activated!"
+
+# Activate conda when start docker
+SHELL ["/bin/bash", "--login", "-c"]
+RUN echo ". /opt/conda/etc/profile.d/conda.sh" >> ~/.bashrc && \
+    echo "conda activate verl-agent-311" >> ~/.bashrc
+
+RUN echo "cd /usr/home/workspace && pip install -e . 'vllm==0.8.5'" >> ~/.bashrc
+
+#RUN pip install torch==2.4.1+cu118 torchvision --index-url https://download.pytorch.org/whl/cu118
+RUN pip install torch==2.5.1+cu118 torchvision --index-url https://download.pytorch.org/whl/cu118
+
+#RUN pip install flash-attn==2.7.4.post1 --no-build-isolation
+
+
+RUN echo "cd /usr/home/workspace && pip install -e agent_system/environments/env_package/craftext/CrafText-super_igor_env_build" >> ~/.bashrc
+RUN echo "cd /usr/home/workspace && pip install flash-attn==2.7.4.post1 --no-build-isolation" >> ~/.bashrc
+#RUN pip install -e agent_system/environments/env_package/craftext/CrafText-super_igor_env_build
+RUN pip install datasets
+#RUN pip install tensorboard
+RUN echo "pip install tensorboard" >> ~/.bashrc
+RUN echo "pip install comet_ml" >> ~/.bashrc
+
+# Install Flash-RL for quantized rollouts
+RUN echo "pip install flash-llm-rl" >> ~/.bashrc
+
+WORKDIR /usr/home/workspace
