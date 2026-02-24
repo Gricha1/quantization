@@ -179,7 +179,12 @@ class ActorRolloutRefWorker(Worker):
     ):
         from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
-        from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
+        from transformers import AutoConfig, AutoModelForCausalLM
+        try:
+            from transformers import AutoModelForVision2Seq
+            HAS_VISION2SEQ = True
+        except ImportError:
+            HAS_VISION2SEQ = False
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
@@ -224,7 +229,7 @@ class ActorRolloutRefWorker(Worker):
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
+            if HAS_VISION2SEQ and type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
                 actor_module_class = AutoModelForVision2Seq
             else:
                 actor_module_class = AutoModelForCausalLM

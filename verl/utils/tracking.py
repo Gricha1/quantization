@@ -34,7 +34,7 @@ class Tracking:
         logger: Dictionary of initialized logger instances for each backend.
     """
 
-    supported_backend = ["wandb", "mlflow", "swanlab", "vemlp_wandb", "tensorboard", "console", "clearml"]
+    supported_backend = ["wandb", "mlflow", "swanlab", "vemlp_wandb", "tensorboard", "console", "clearml", "comet_ml"]
 
     def __init__(self, project_name, experiment_name, default_backend: Union[str, List[str]] = "console", config=None):
         if isinstance(default_backend, str):
@@ -128,6 +128,9 @@ class Tracking:
         if "clearml" in default_backend:
             self.logger["clearml"] = ClearMLLogger(project_name, experiment_name, config)
 
+        if "comet_ml" in default_backend:
+            self.logger["comet_ml"] = CometMLLogger(project_name, experiment_name, config)
+
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
@@ -143,8 +146,10 @@ class Tracking:
         if "tensorboard" in self.logger:
             self.logger["tensorboard"].finish()
 
-        if "clearnml" in self.logger:
-            self.logger["clearnml"].finish()
+        if "clearml" in self.logger:
+            self.logger["clearml"].finish()
+        if "comet_ml" in self.logger:
+            self.logger["comet_ml"].finish()
 
 
 class ClearMLLogger:
@@ -194,6 +199,40 @@ class ClearMLLogger:
 
     def finish(self):
         self._task.mark_completed()
+
+
+class CometMLLogger:
+    def __init__(self, project_name: str, experiment_name: str, config):
+        import comet_ml
+
+        self.project_name = project_name
+        self.experiment_name = experiment_name
+
+        # Initialize Comet ML experiment (will be stored globally)
+        self._experiment = comet_ml.Experiment(
+            project_name=project_name,
+            experiment_name=experiment_name,
+            auto_param_logging=False,
+            auto_metric_logging=False,
+        )
+
+        # Log config as hyperparameters
+        if config is not None:
+            self._experiment.log_parameters(_flatten_dict(_transform_params_to_json_serializable(config, convert_list_to_dict=True), sep="/"))
+
+    def log(self, data, step):
+        import numpy as np
+
+        for k, v in data.items():
+            if isinstance(v, (int, float, np.floating, np.integer)):
+                self._experiment.log_metric(k, v, step=step)
+            elif isinstance(v, (list, tuple)) and all(isinstance(x, (int, float, np.floating, np.integer)) for x in v):
+                # Log list of numbers as metrics
+                for i, val in enumerate(v):
+                    self._experiment.log_metric(f"{k}_{i}", val, step=step)
+
+    def finish(self):
+        self._experiment.end()
 
 
 class _TensorboardAdapter:
@@ -270,6 +309,8 @@ class ValidationGenerationsLogger:
 
         if "clearml" in loggers:
             self.log_generations_to_clearml(samples, step)
+        if "comet_ml" in loggers:
+            self.log_generations_to_comet_ml(samples, step)
         if "tensorboard" in loggers:
             self.log_generations_to_tensorboard(samples, step)
 
@@ -371,6 +412,29 @@ class ValidationGenerationsLogger:
             table_plot=pd.DataFrame.from_records(table),
             iteration=step,
         )
+
+    def log_generations_to_comet_ml(self, samples, step):
+        """Log validation generation to comet_ml as table"""
+        import comet_ml
+        import pandas as pd
+
+        # Get current experiment (should be initialized by CometMLLogger)
+        experiment = comet_ml.get_global_experiment()
+        if experiment is None:
+            return
+
+        table = [
+            {
+                "step": step,
+                "input": sample[0],
+                "output": sample[1],
+                "score": sample[2],
+            }
+            for sample in samples
+        ]
+
+        df = pd.DataFrame.from_records(table)
+        experiment.log_table("val/generations", tabular_data=df, step=step)
 
     def log_generations_to_tensorboard(self, samples, step):
         """Log samples to tensorboard as text"""

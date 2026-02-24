@@ -502,26 +502,50 @@ def patch_valuehead_model(model) -> None:
 
 
 def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
-    from transformers import AutoModelForTokenClassification, AutoModelForCausalLM, AutoModelForVision2Seq
-
+    from transformers import AutoModelForTokenClassification, AutoModelForCausalLM
     try:
-        model = AutoModelForTokenClassification.from_pretrained(
-            pretrained_model_name_or_path=local_path,
-            torch_dtype=torch_dtype,
-            config=model_config,
-            attn_implementation="flash_attention_2",
-            trust_remote_code=trust_remote_code,
-        )
-        return model
-    except BaseException as e:
-        if not is_trl_available():
-            raise RuntimeError(f"model({local_path}) is not a value head model, please install trl to make it valid") from e
+        from transformers import AutoModelForVision2Seq
+        HAS_VISION2SEQ = True
+    except ImportError:
+        HAS_VISION2SEQ = False
 
-    assert is_trl_available()
+    # Check if this is a causal LM model - skip token classification for those
+    model_type = getattr(model_config, 'model_type', None)
+    is_causal_lm = model_type in ['qwen2', 'llama', 'mistral', 'gemma', 'phi', 'gpt2', 'gpt_neox', 'opt', 'bloom', 'falcon', 'mpt', 'baichuan', 'chatglm']
+    
+    # Try to load as token classification model first (for reward models only, not causal LM)
+    # But check if it has prepare_inputs_for_generation method (needed for PPO critic)
+    if not is_causal_lm:
+        try:
+            model = AutoModelForTokenClassification.from_pretrained(
+                pretrained_model_name_or_path=local_path,
+                torch_dtype=torch_dtype,
+                config=model_config,
+                attn_implementation="flash_attention_2",
+                trust_remote_code=trust_remote_code,
+            )
+            # Check if model has prepare_inputs_for_generation (needed for PPO critic)
+            if hasattr(model, 'prepare_inputs_for_generation'):
+                return model
+            # If not, fall through to load as causal LM with value head
+        except BaseException as e:
+            # If loading as token classification fails, continue to load as causal LM
+            pass
+
+    # For causal LM models, always use value head
+    try:
+        trl_available = is_trl_available()
+    except Exception:
+        trl_available = False
+    
+    if not trl_available:
+        raise RuntimeError(f"model({local_path}) is not a value head model, please install trl to make it valid. Try: pip install trl")
 
     from trl import AutoModelForCausalLMWithValueHead
 
-    if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
+    from trl import AutoModelForCausalLMWithValueHead
+
+    if HAS_VISION2SEQ and type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
         module_class = AutoModelForVision2Seq
     else:
         module_class = AutoModelForCausalLM
