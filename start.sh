@@ -15,7 +15,7 @@ else
 fi
 
 # Use existing safe_llm_img instead of new image
-image_name=safe_llm_img
+image_name=flash_rl_quantization_img
 container_name=flash_rl_quantization_$container_postfix
 
 echo "Image name: $image_name"
@@ -40,6 +40,12 @@ fi
 echo "GPUs in docker: $gpus"
 echo "Quantization dir: $QUANTIZATION_DIR"
 echo "Mounting quantization to /usr/home/workspace (will override image contents)"
+
+# Create symlink for verl if it doesn't exist (on host, so it persists)
+if [ ! -e "$QUANTIZATION_DIR/verl" ] && [ -d "$QUANTIZATION_DIR/flash_rl/verl" ]; then
+    echo "Creating symlink: $QUANTIZATION_DIR/verl -> flash_rl/verl"
+    ln -sf flash_rl/verl "$QUANTIZATION_DIR/verl"
+fi
 
 # Mount quantization directory to /usr/home/workspace
 # Bind mount will override any existing files in the image at that path

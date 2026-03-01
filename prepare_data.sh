@@ -10,10 +10,23 @@ echo "Preparing GSM8K dataset..."
 mkdir -p ~/data/gsm8k
 
 # Check if data preprocessing script exists
-VERL_DIR="/usr/home/workspace/verl"
+# Try both verl and flash_rl/verl paths
+VERL_DIR=""
+if [ -d "/usr/home/workspace/verl" ]; then
+    VERL_DIR="/usr/home/workspace/verl"
+elif [ -d "/usr/home/workspace/flash_rl/verl" ]; then
+    VERL_DIR="/usr/home/workspace/flash_rl/verl"
+else
+    echo "❌ Error: verl directory not found"
+    echo "Expected locations:"
+    echo "  - /usr/home/workspace/verl"
+    echo "  - /usr/home/workspace/flash_rl/verl"
+    exit 1
+fi
+
 if [ ! -f "$VERL_DIR/examples/data_preprocess/gsm8k.py" ]; then
     echo "❌ Error: Data preprocessing script not found at $VERL_DIR/examples/data_preprocess/gsm8k.py"
-    echo "Make sure verl repository is cloned in /usr/home/workspace/verl"
+    echo "Make sure verl repository is cloned"
     exit 1
 fi
 
