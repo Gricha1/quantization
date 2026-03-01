@@ -147,7 +147,7 @@ python -m verl.trainer.main_ppo \
   trainer.nnodes=1 \
   trainer.save_freq=20 \
   trainer.test_freq=10 \
-  trainer.total_epochs=15 \
+  trainer.total_epochs=30 \
   2>&1 | tee ${RUN_NAME}.log
 
 echo "Training completed!"
