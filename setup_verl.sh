@@ -43,17 +43,25 @@ python -c "import flash_rl; print('✓ Flash-RL is already installed')" || {
 echo "Checking verl installation..."
 python -c "import verl.trainer" 2>/dev/null && echo "✓ verl is already installed" || {
     echo "verl not found. Installing verl..."
-    if [ ! -d "verl" ]; then
-        echo "ERROR: verl directory not found. Please clone verl first:"
+    
+    # Get the script directory to find verl relative to it
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    VERL_DIR="$SCRIPT_DIR/verl"
+    
+    if [ ! -d "$VERL_DIR" ]; then
+        echo "ERROR: verl directory not found at $VERL_DIR"
+        echo "Please ensure verl is cloned in quantization/verl:"
+        echo "  cd $SCRIPT_DIR"
         echo "  git clone -b flash-rl https://github.com/yaof20/verl"
         exit 1
     fi
-    echo "Installing verl from existing directory..."
-    cd verl
+    echo "Installing verl from $VERL_DIR..."
+    cd "$VERL_DIR"
+    pip uninstall -y verl 2>/dev/null || true  # Uninstall old verl if exists
     pip install --no-deps -e .
-    cd ..
+    cd "$SCRIPT_DIR"
     echo "Verifying verl installation..."
-    python -c "import verl.trainer; print('✓ verl installed successfully')" || {
+    python -c "import verl.trainer; import verl; import inspect; print('✓ verl installed successfully from:', inspect.getfile(verl))" || {
         echo "ERROR: Failed to install verl. Please check the output above."
         exit 1
     }
