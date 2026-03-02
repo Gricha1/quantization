@@ -78,6 +78,7 @@ class AdvantageEstimator(str, Enum):
     RLOO = "rloo"
     OPO = "opo"
     GRPO_PASSK = "grpo_passk"
+    VTRACE = "vtrace"
 
 
 class AdaptiveKLController:
@@ -477,6 +478,105 @@ def compute_remax_outcome_advantage(token_level_rewards: torch.Tensor, reward_ba
         returns = (token_level_rewards * response_mask).flip(dims=[-1]).cumsum(dim=-1).flip(dims=[-1])
         advantages = returns - reward_baselines.unsqueeze(-1) * response_mask
 
+    return advantages, returns
+
+@register_adv_est(AdvantageEstimator.VTRACE) # or simply: @register_adv_est("vtrace")
+def compute_vtrace_advantage_return(
+    token_level_rewards: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    rollout_log_probs: torch.Tensor,
+    gamma: torch.Tensor,
+    rho_bar: float = 1.0,
+    c_bar: float = 1.0,
+):
+    """
+    Compute V-trace advantage and returns for off-policy correction.
+    
+    Based on: "IMPALA: Scalable Distributed Deep-RL with Importance Weighted Actor-Learner Architectures"
+    https://arxiv.org/abs/1802.01561
+    
+    V-trace corrects value estimates when using off-policy data by applying truncated importance sampling.
+    
+    Mathematical formulation:
+        ρ_t = min(ρ̄, π(a_t|s_t) / μ(a_t|s_t))
+        c_t = min(c̄, π(a_t|s_t) / μ(a_t|s_t))
+        δ_t = r_t + γV(s_{t+1}) - V(s_t)
+        v_t = V(s_t) + ρ_t * (r_t + γv_{t+1} - V(s_t))
+    
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length) - rewards at each timestep
+        values: `(torch.Tensor)`
+            shape: (bs, response_length) - value estimates V(s_t)
+        response_mask: `(torch.Tensor)`
+            shape: (bs, response_length) - mask for valid tokens
+        old_log_probs: `(torch.Tensor)`
+            shape: (bs, response_length) - log probs under current policy π
+        rollout_log_probs: `(torch.Tensor)`
+            shape: (bs, response_length) - log probs under behavior policy μ
+        gamma: `(float)`
+            discount factor
+        rho_bar: `(float)`
+            truncation threshold for importance weights (default: 1.0)
+        c_bar: `(float)`
+            truncation threshold for c weights (default: 1.0, should be <= rho_bar)
+    
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length) - V-trace advantages
+        returns: `(torch.Tensor)`
+            shape: (bs, response_length) - V-trace returns
+    """
+    with torch.no_grad():
+        # Compute importance ratios: π(a_t|s_t) / μ(a_t|s_t) = exp(log π - log μ)
+        log_ratio = old_log_probs - rollout_log_probs
+        importance_ratio = torch.exp(log_ratio)
+        
+        # Truncated importance weights
+        rho_t = torch.clamp(importance_ratio, max=rho_bar)
+        c_t = torch.clamp(importance_ratio, max=c_bar)
+        
+        # Initialize V-trace values
+        gen_len = token_level_rewards.shape[-1]
+        v_trace_values = torch.zeros_like(values)
+        
+        # Compute V-trace backwards (recursive form)
+        # v_t = V(s_t) + ρ_t * (r_t + γv_{t+1} - V(s_t))
+        # We iterate backwards and use the computed v_{t+1} for the next step
+        for t in reversed(range(gen_len)):
+            # Get current values
+            v_t = values[:, t]
+            r_t = token_level_rewards[:, t]
+            rho = rho_t[:, t]
+            mask_t = response_mask[:, t]
+            
+            # For last timestep, v_next = 0, otherwise use computed v_trace from next step
+            if t < gen_len - 1:
+                v_next_t = v_trace_values[:, t + 1]
+            else:
+                v_next_t = torch.zeros_like(v_t)
+            
+            # TD error: δ_t = r_t + γV(s_{t+1}) - V(s_t)
+            # But in V-trace we use v_{t+1} instead of V(s_{t+1})
+            delta_t = r_t + gamma * v_next_t - v_t
+            
+            # V-trace update: v_t = V(s_t) + ρ_t * (r_t + γv_{t+1} - V(s_t))
+            v_trace_t = v_t + rho * delta_t
+            
+            # Apply mask: only update for valid tokens
+            v_trace_values[:, t] = v_trace_t * mask_t + v_t * (1 - mask_t)
+        
+        # Returns are V-trace values
+        returns = v_trace_values
+        
+        # Advantages = returns - baseline (values)
+        advantages = returns - values
+        
+        # Normalize advantages (similar to GAE)
+        advantages = verl_F.masked_whiten(advantages, response_mask)
+    
     return advantages, returns
 
 

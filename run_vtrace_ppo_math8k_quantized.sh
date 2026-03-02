@@ -1,26 +1,30 @@
 #!/bin/bash
-# PPO training script with Flash-RL quantization on 8k math dataset
-# Usage: bash run_ppo_math8k_quantized.sh [RUN_NAME] [QUANTIZATION_TYPE] [FP32_LM_HEAD]
+# PPO training script with V-trace and Flash-RL quantization on 8k math dataset
+# Usage: bash run_vtrace_ppo_math8k_quantized.sh [RUN_NAME] [QUANTIZATION_TYPE] [FP32_LM_HEAD] [RHO_BAR] [C_BAR]
 # RUN_NAME: experiment name (default: auto-generated)
 # QUANTIZATION_TYPE: fp8 or int8 (default: fp8)
 # FP32_LM_HEAD: use FP32 for LM head, 0 or 1 (default: 0)
+# RHO_BAR: V-trace rho truncation threshold (default: 1.0)
+# C_BAR: V-trace c truncation threshold (default: 1.0)
 
 set -e
 
-# Parse arguments (like flash-rl examples)
+# Parse arguments
 RUN_NAME=${1:-""}
 QUANTIZATION_TYPE=${2:-"fp8"}
 FP32_LM_HEAD=${3:-"0"}
+RHO_BAR=${4:-"1.0"}
+C_BAR=${5:-"1.0"}
 
 # If RUN_NAME is empty, generate one
 if [ -z "$RUN_NAME" ]; then
-    RUN_NAME="ppo_math8k_${QUANTIZATION_TYPE}_Qwen2.5-32B_$(date +%Y%m%d-%H%M%S)"
+    RUN_NAME="ppo_vtrace_math8k_${QUANTIZATION_TYPE}_Qwen2.5-32B_$(date +%Y%m%d-%H%M%S)"
 fi
 
 # Validate quantization type
 if [[ ! "$QUANTIZATION_TYPE" =~ ^(fp8|int8)$ ]]; then
     echo "ERROR: Invalid QUANTIZATION_TYPE='$QUANTIZATION_TYPE'. Must be one of: fp8, int8"
-    echo "Usage: bash $0 [RUN_NAME] [QUANTIZATION_TYPE] [FP32_LM_HEAD]"
+    echo "Usage: bash $0 [RUN_NAME] [QUANTIZATION_TYPE] [FP32_LM_HEAD] [RHO_BAR] [C_BAR]"
     exit 1
 fi
 
@@ -58,12 +62,14 @@ export RAY_TEMP_DIR="${RAY_TEMP_DIR:-/tmp/ray_temp}"
 mkdir -p $RAY_TEMP_DIR
 
 echo "=========================================="
-echo "Flash-RL PPO Training with Quantization"
+echo "Flash-RL PPO Training with V-trace"
 echo "=========================================="
 echo "Run Name: $RUN_NAME"
 echo "Quantization Type: $QUANTIZATION_TYPE"
 echo "Model: $MODEL_NAME"
 echo "FP32 LM Head: $FP32_LM_HEAD"
+echo "V-trace rho_bar: $RHO_BAR"
+echo "V-trace c_bar: $C_BAR"
 echo "FLASHRL_CONFIG: $FLASHRL_CONFIG"
 echo "=========================================="
 
@@ -106,9 +112,11 @@ echo "Using data files:"
 echo "  Train: $TRAIN_DATA_PATH"
 echo "  Val: $VAL_DATA_PATH"
 
-# Run PPO training with quantization
+# Run PPO training with V-trace and quantization
 python -m verl.trainer.main_ppo \
-  algorithm.adv_estimator=gae \
+  algorithm.adv_estimator=vtrace \
+  algorithm.vtrace_rho_bar=${RHO_BAR} \
+  algorithm.vtrace_c_bar=${C_BAR} \
   data.train_files=$TRAIN_DATA_PATH \
   data.val_files=$VAL_DATA_PATH \
   data.train_batch_size=$train_data_size \
@@ -128,7 +136,7 @@ python -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
   actor_rollout_ref.rollout.name=vllm \
-  actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
   actor_rollout_ref.rollout.disable_log_stats=False \
   critic.optim.lr=1e-5 \
   critic.model.use_remove_padding=False \

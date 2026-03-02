@@ -254,8 +254,32 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.VTRACE:
+        # Compute advantages and returns using V-trace for off-policy correction
+        # V-trace requires old_log_probs (current policy) and rollout_log_probs (behavior policy)
+        if "old_log_probs" not in data.batch:
+            raise ValueError("V-trace requires 'old_log_probs' in data.batch")
+        if "rollout_log_probs" not in data.batch:
+            raise ValueError("V-trace requires 'rollout_log_probs' in data.batch")
+        
+        # Get V-trace parameters from config
+        rho_bar = config.get("vtrace_rho_bar", 1.0) if config else 1.0
+        c_bar = config.get("vtrace_c_bar", 1.0) if config else 1.0
+        
+        advantages, returns = core_algos.compute_vtrace_advantage_return(
+            token_level_rewards=data.batch["token_level_rewards"],
+            values=data.batch["values"],
+            response_mask=data.batch["response_mask"],
+            old_log_probs=data.batch["old_log_probs"],
+            rollout_log_probs=data.batch["rollout_log_probs"],
+            gamma=gamma,
+            rho_bar=rho_bar,
+            c_bar=c_bar,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
-        # handle all other adv estimator type other than GAE and GRPO
+        # handle all other adv estimator type other than GAE, GRPO, and VTRACE
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
         adv_kwargs = {
             "token_level_rewards": data.batch["token_level_rewards"],
@@ -327,7 +351,10 @@ class RayPPOTrainer:
         if config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(config.algorithm.kl_ctrl)
 
-        if self.config.algorithm.adv_estimator == AdvantageEstimator.GAE:
+        if self.config.algorithm.adv_estimator in [
+            AdvantageEstimator.GAE,
+            AdvantageEstimator.VTRACE,
+        ]:
             self.use_critic = True
         elif self.config.algorithm.adv_estimator in [
             AdvantageEstimator.GRPO,

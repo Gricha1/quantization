@@ -738,11 +738,18 @@ algorithm:
   # Trade-off between bias and variance in the GAE estimator
   lam: 1.0
 
-  # Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
+  # Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", "vtrace", etc.
   adv_estimator: gae
 
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
+
+  # V-trace parameters (only used when adv_estimator=vtrace)
+  # Truncation threshold for importance weights ρ (rho_bar)
+  vtrace_rho_bar: 1.0
+
+  # Truncation threshold for c weights (c_bar, should be <= rho_bar)
+  vtrace_c_bar: 1.0
 
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
