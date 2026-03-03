@@ -318,46 +318,85 @@ class ValidationGenerationsLogger:
         """Log samples to wandb as a table"""
         import wandb
 
-        # Create column names for all samples
-        columns = ["step"] + sum([[f"input_{i + 1}", f"output_{i + 1}", f"score_{i + 1}"] for i in range(len(samples))], [])
+        # Check if samples have ground truth and correctness (5 elements) or just basic info (3 elements)
+        has_gt = len(samples) > 0 and len(samples[0]) >= 5
+        
+        if has_gt:
+            # Create table with 4 columns: Task, LLM Answer, Ground Truth, Correct
+            columns = ["Task", "LLM Answer", "Ground Truth", "Correct"]
+            table_data = []
+            for sample in samples:
+                input_text, output_text, score, ground_truth, correct = sample[:5]
+                table_data.append([input_text, output_text, str(ground_truth), "✓" if correct else "✗"])
+            
+            new_table = wandb.Table(columns=columns, data=table_data)
+            wandb.log({"val/generations": new_table}, step=step)
+        else:
+            # Fallback to old format for backward compatibility
+            columns = ["step"] + sum([[f"input_{i + 1}", f"output_{i + 1}", f"score_{i + 1}"] for i in range(len(samples))], [])
 
-        if not hasattr(self, "validation_table"):
-            # Initialize the table on first call
-            self.validation_table = wandb.Table(columns=columns)
+            if not hasattr(self, "validation_table"):
+                # Initialize the table on first call
+                self.validation_table = wandb.Table(columns=columns)
 
-        # Create a new table with same columns and existing data
-        # Workaround for https://github.com/wandb/wandb/issues/2981#issuecomment-1997445737
-        new_table = wandb.Table(columns=columns, data=self.validation_table.data)
+            # Create a new table with same columns and existing data
+            # Workaround for https://github.com/wandb/wandb/issues/2981#issuecomment-1997445737
+            new_table = wandb.Table(columns=columns, data=self.validation_table.data)
 
-        # Add new row with all data
-        row_data = []
-        row_data.append(step)
-        for sample in samples:
-            row_data.extend(sample)
+            # Add new row with all data
+            row_data = []
+            row_data.append(step)
+            for sample in samples:
+                row_data.extend(sample[:3])  # Only take first 3 elements for backward compatibility
 
-        new_table.add_data(*row_data)
+            new_table.add_data(*row_data)
 
-        # Update reference and log
-        wandb.log({"val/generations": new_table}, step=step)
-        self.validation_table = new_table
+            # Update reference and log
+            wandb.log({"val/generations": new_table}, step=step)
+            self.validation_table = new_table
 
     def log_generations_to_swanlab(self, samples, step):
         """Log samples to swanlab as text"""
         import swanlab
 
+        # Check if samples have ground truth and correctness (5 elements) or just basic info (3 elements)
+        has_gt = len(samples) > 0 and len(samples[0]) >= 5
+
         swanlab_text_list = []
         for i, sample in enumerate(samples):
-            row_text = f"""
-            input: {sample[0]}
-            
-            ---
-            
-            output: {sample[1]}
-            
-            ---
-            
-            score: {sample[2]}
-            """
+            if has_gt:
+                input_text, output_text, score, ground_truth, correct = sample[:5]
+                row_text = f"""
+                Task: {input_text}
+                
+                ---
+                
+                LLM Answer: {output_text}
+                
+                ---
+                
+                Ground Truth: {ground_truth}
+                
+                ---
+                
+                Correct: {"✓" if correct else "✗"}
+                
+                ---
+                
+                Score: {score}
+                """
+            else:
+                row_text = f"""
+                input: {sample[0]}
+                
+                ---
+                
+                output: {sample[1]}
+                
+                ---
+                
+                score: {sample[2]}
+                """
             swanlab_text_list.append(swanlab.Text(row_text, caption=f"sample {i + 1}"))
 
         # Log to swanlab
@@ -372,15 +411,27 @@ class ValidationGenerationsLogger:
 
         import mlflow
 
+        # Check if samples have ground truth and correctness (5 elements) or just basic info (3 elements)
+        has_gt = len(samples) > 0 and len(samples[0]) >= 5
+
         try:
             with tempfile.TemporaryDirectory() as tmp_dir:
                 validation_gen_step_file = Path(tmp_dir, f"val_step{step}.json")
                 row_data = []
                 for sample in samples:
-                    data = {"input": sample[0], "output": sample[1], "score": sample[2]}
+                    if has_gt:
+                        data = {
+                            "Task": sample[0],
+                            "LLM Answer": sample[1],
+                            "Ground Truth": str(sample[3]),
+                            "Correct": "✓" if sample[4] else "✗",
+                            "Score": sample[2],
+                        }
+                    else:
+                        data = {"input": sample[0], "output": sample[1], "score": sample[2]}
                     row_data.append(data)
                 with open(validation_gen_step_file, "w") as file:
-                    json.dump(row_data, file)
+                    json.dump(row_data, file, indent=2)
                 mlflow.log_artifact(validation_gen_step_file)
         except Exception as e:
             print(f"WARNING: save validation generation file to mlflow failed with error {e}")
@@ -395,15 +446,30 @@ class ValidationGenerationsLogger:
         if task is None:
             return
 
-        table = [
-            {
-                "step": step,
-                "input": sample[0],
-                "output": sample[1],
-                "score": sample[2],
-            }
-            for sample in samples
-        ]
+        # Check if samples have ground truth and correctness (5 elements) or just basic info (3 elements)
+        has_gt = len(samples) > 0 and len(samples[0]) >= 5
+        
+        if has_gt:
+            table = [
+                {
+                    "Task": sample[0],
+                    "LLM Answer": sample[1],
+                    "Ground Truth": str(sample[3]),
+                    "Correct": "✓" if sample[4] else "✗",
+                    "Score": sample[2],
+                }
+                for sample in samples
+            ]
+        else:
+            table = [
+                {
+                    "step": step,
+                    "input": sample[0],
+                    "output": sample[1],
+                    "score": sample[2],
+                }
+                for sample in samples
+            ]
 
         logger = task.get_logger()
         logger.report_table(
@@ -417,24 +483,150 @@ class ValidationGenerationsLogger:
         """Log validation generation to comet_ml as table"""
         import comet_ml
         import pandas as pd
+        import json
+        import tempfile
+        import os
 
         # Get current experiment (should be initialized by CometMLLogger)
         experiment = comet_ml.get_global_experiment()
         if experiment is None:
+            print("WARNING: Comet ML experiment not found. Table will not be logged.")
             return
 
-        table = [
-            {
-                "step": step,
-                "input": sample[0],
-                "output": sample[1],
-                "score": sample[2],
-            }
-            for sample in samples
-        ]
+        try:
+            # Check if samples have ground truth and correctness (5 elements) or just basic info (3 elements)
+            has_gt = len(samples) > 0 and len(samples[0]) >= 5
+            
+            # Helper function to truncate and clean text (shorter limit for Comet ML)
+            def clean_text(text, max_length=2000):
+                """Truncate text and ensure it's a valid string"""
+                if text is None:
+                    return ""
+                text_str = str(text)
+                # Remove or replace problematic characters
+                text_str = text_str.replace('\x00', '')  # Remove null bytes
+                text_str = text_str.replace('\r', ' ')  # Replace carriage returns
+                # Truncate if too long
+                if len(text_str) > max_length:
+                    text_str = text_str[:max_length] + "... [truncated]"
+                return text_str
+            
+            if has_gt:
+                table_data = []
+                for sample in samples:
+                    try:
+                        task = clean_text(sample[0], max_length=2000)
+                        llm_answer = clean_text(sample[1], max_length=2000)
+                        ground_truth = clean_text(sample[3], max_length=2000)
+                        # Use simple True/False instead of special characters
+                        correct = "Yes" if sample[4] else "No"
+                        score = float(sample[2]) if isinstance(sample[2], (int, float)) else 0.0
+                        
+                        table_data.append({
+                            "Task": task,
+                            "LLM Answer": llm_answer,
+                            "Ground Truth": ground_truth,
+                            "Correct": correct,
+                            "Score": score,
+                        })
+                    except Exception as e:
+                        print(f"WARNING: Error processing sample: {e}")
+                        continue
+            else:
+                table_data = []
+                for sample in samples:
+                    try:
+                        table_data.append({
+                            "step": int(step),
+                            "input": clean_text(sample[0], max_length=2000),
+                            "output": clean_text(sample[1], max_length=2000),
+                            "score": float(sample[2]) if isinstance(sample[2], (int, float)) else 0.0,
+                        })
+                    except Exception as e:
+                        print(f"WARNING: Error processing sample: {e}")
+                        continue
 
-        df = pd.DataFrame.from_records(table)
-        experiment.log_table("val/generations", tabular_data=df, step=step)
+            if not table_data:
+                print("WARNING: No valid samples to log to Comet ML")
+                return
+
+            # Try multiple methods to log to Comet ML
+            success = False
+            
+            # Method 1: Try log_table with DataFrame (original method)
+            try:
+                df = pd.DataFrame.from_records(table_data)
+                # Ensure all columns are of appropriate types
+                for col in df.columns:
+                    if col in ["Score", "score", "step"]:
+                        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+                    else:
+                        df[col] = df[col].astype(str)
+                
+                # Try logging as table
+                experiment.log_table(f"val/generations_step_{step}", tabular_data=df, step=step)
+                success = True
+                print(f"Successfully logged validation table with {len(table_data)} samples to Comet ML at step {step}")
+            except Exception as e1:
+                print(f"WARNING: log_table failed: {e1}, trying alternative method...")
+                
+                # Method 2: Log as CSV file (most reliable format)
+                try:
+                    df = pd.DataFrame.from_records(table_data)
+                    # Ensure all columns are of appropriate types
+                    for col in df.columns:
+                        if col in ["Score", "score", "step"]:
+                            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+                        else:
+                            df[col] = df[col].astype(str)
+                    
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8') as f:
+                        df.to_csv(f, index=False, encoding='utf-8')
+                        temp_path = f.name
+                    
+                    # Log as asset (CSV format)
+                    experiment.log_asset(temp_path, file_name=f"val_generations_step_{step}.csv", step=step)
+                    os.unlink(temp_path)  # Clean up temp file
+                    success = True
+                    print(f"Successfully logged validation table as CSV with {len(table_data)} samples to Comet ML at step {step}")
+                except Exception as e2:
+                    print(f"WARNING: CSV logging failed: {e2}, trying JSON...")
+                    # Method 3: Log as JSON file (fallback)
+                    try:
+                        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8') as f:
+                            json.dump(table_data, f, indent=2, ensure_ascii=False)
+                            temp_path = f.name
+                        
+                        # Log as asset
+                        experiment.log_asset(temp_path, file_name=f"val_generations_step_{step}.json", step=step)
+                        os.unlink(temp_path)  # Clean up temp file
+                        success = True
+                        print(f"Successfully logged validation table as JSON with {len(table_data)} samples to Comet ML at step {step}")
+                    except Exception as e3:
+                        print(f"ERROR: All file methods failed. log_table: {e1}, CSV: {e2}, JSON: {e3}")
+                        import traceback
+                        traceback.print_exc()
+            
+            if not success:
+                # Method 4: Log as text summary (final fallback)
+                try:
+                    text_summary = f"Validation Results at Step {step}\n\n"
+                    for i, row in enumerate(table_data[:5]):  # Only first 5 for text
+                        text_summary += f"Sample {i+1}:\n"
+                        for key, value in row.items():
+                            text_summary += f"  {key}: {str(value)[:200]}\n"
+                        text_summary += "\n"
+                    experiment.log_text(text_summary, step=step)
+                    print(f"Logged validation summary as text to Comet ML at step {step}")
+                except Exception as e4:
+                    print(f"ERROR: All logging methods failed. Last error: {e4}")
+                    import traceback
+                    traceback.print_exc()
+            
+        except Exception as e:
+            print(f"ERROR: Failed to log validation table to Comet ML: {e}")
+            import traceback
+            traceback.print_exc()
 
     def log_generations_to_tensorboard(self, samples, step):
         """Log samples to tensorboard as text"""
@@ -446,16 +638,26 @@ class ValidationGenerationsLogger:
             os.makedirs(tensorboard_dir, exist_ok=True)
             self.writer = SummaryWriter(log_dir=tensorboard_dir)
 
+        # Check if samples have ground truth and correctness (5 elements) or just basic info (3 elements)
+        has_gt = len(samples) > 0 and len(samples[0]) >= 5
+
         # Format the samples data into readable text
         text_content = f"**Generation Results - Step {step}**\n\n"
 
         for i, sample in enumerate(samples):
             text_content += f"### Sample {i + 1}\n"
 
-            # Assuming sample contains [input, output, score]
-            if len(sample) >= 3:
+            # Check if sample has ground truth and correctness
+            if has_gt and len(sample) >= 5:
+                input_text, output_text, score, ground_truth, correct = sample[:5]
+                text_content += f"**Task:** {input_text}\n\n"
+                text_content += f"**LLM Answer:** {output_text}\n\n"
+                text_content += f"**Ground Truth:** {ground_truth}\n\n"
+                text_content += f"**Correct:** {'✓' if correct else '✗'}\n\n"
+                text_content += f"**Score:** {score}\n\n"
+            elif len(sample) >= 3:
+                # Fallback to old format
                 input_text, output_text, score = sample[0], sample[1], sample[2]
-
                 text_content += f"**Input:** {input_text}\n\n"
                 text_content += f"**Output:** {output_text}\n\n"
                 text_content += f"**Score:** {score}\n\n"

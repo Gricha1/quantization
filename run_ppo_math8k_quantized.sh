@@ -147,6 +147,7 @@ python -m verl.trainer.main_ppo \
   trainer.nnodes=1 \
   trainer.save_freq=20 \
   trainer.test_freq=10 \
+  trainer.log_val_generations=10 \
   trainer.total_epochs=30 \
   trainer.max_actor_ckpt_to_keep=1 \
   trainer.max_critic_ckpt_to_keep=1 \

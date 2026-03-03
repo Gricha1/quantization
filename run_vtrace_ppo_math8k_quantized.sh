@@ -4,8 +4,8 @@
 # RUN_NAME: experiment name (default: auto-generated)
 # QUANTIZATION_TYPE: fp8 or int8 (default: fp8)
 # FP32_LM_HEAD: use FP32 for LM head, 0 or 1 (default: 0)
-# RHO_BAR: V-trace rho truncation threshold (default: 1.0)
-# C_BAR: V-trace c truncation threshold (default: 1.0)
+# RHO_BAR: V-trace rho truncation threshold (default: 0.8, more conservative)
+# C_BAR: V-trace c truncation threshold (default: 0.8, more conservative)
 
 set -e
 
@@ -13,8 +13,8 @@ set -e
 RUN_NAME=${1:-""}
 QUANTIZATION_TYPE=${2:-"fp8"}
 FP32_LM_HEAD=${3:-"0"}
-RHO_BAR=${4:-"1.0"}
-C_BAR=${5:-"1.0"}
+RHO_BAR=${4:-"0.8"}
+C_BAR=${5:-"0.8"}
 
 # If RUN_NAME is empty, generate one
 if [ -z "$RUN_NAME" ]; then
@@ -136,7 +136,7 @@ python -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
   actor_rollout_ref.rollout.name=vllm \
-  actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.55 \
   actor_rollout_ref.rollout.disable_log_stats=False \
   critic.optim.lr=1e-5 \
   critic.model.use_remove_padding=False \
@@ -153,8 +153,10 @@ python -m verl.trainer.main_ppo \
   trainer.n_gpus_per_node=2 \
   trainer.val_before_train=True \
   trainer.nnodes=1 \
+  actor_rollout_ref.actor.imp_ratio_cap=-1 \
   trainer.save_freq=20 \
   trainer.test_freq=10 \
+  trainer.log_val_generations=10 \
   trainer.total_epochs=30 \
   trainer.max_actor_ckpt_to_keep=1 \
   trainer.max_critic_ckpt_to_keep=1 \

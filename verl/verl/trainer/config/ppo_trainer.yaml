@@ -746,10 +746,12 @@ algorithm:
 
   # V-trace parameters (only used when adv_estimator=vtrace)
   # Truncation threshold for importance weights ρ (rho_bar)
-  vtrace_rho_bar: 1.0
+  # Lower values (0.5-0.8) are more conservative and prevent overestimation
+  vtrace_rho_bar: 0.8
 
   # Truncation threshold for c weights (c_bar, should be <= rho_bar)
-  vtrace_c_bar: 1.0
+  # Lower values reduce variance but may introduce bias
+  vtrace_c_bar: 0.8
 
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False

@@ -581,7 +581,35 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
+    def _check_answer_correctness(self, output: str, ground_truth: str) -> bool:
+        """Check if the output answer matches the ground truth answer."""
+        if ground_truth == "N/A":
+            return False
+        
+        # Extract numbers from both strings (for math problems)
+        import re
+        
+        # Extract the last number from output (usually the final answer)
+        output_numbers = re.findall(r'-?\d+\.?\d*', output)
+        gt_numbers = re.findall(r'-?\d+\.?\d*', ground_truth)
+        
+        if output_numbers and gt_numbers:
+            # Compare the last number in output with ground truth
+            try:
+                output_num = float(output_numbers[-1])
+                gt_num = float(gt_numbers[-1] if gt_numbers else ground_truth)
+                return abs(output_num - gt_num) < 1e-6
+            except ValueError:
+                pass
+        
+        # Fallback to string matching (case-insensitive, strip whitespace)
+        output_clean = output.strip().lower()
+        gt_clean = ground_truth.strip().lower()
+        
+        # Check if ground truth is contained in output or vice versa
+        return gt_clean in output_clean or output_clean in gt_clean
+    
+    def _maybe_log_val_generations(self, inputs, outputs, scores, ground_truths=None, correct=None):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
         generations_to_log = self.config.trainer.log_val_generations
@@ -591,8 +619,13 @@ class RayPPOTrainer:
 
         import numpy as np
 
-        # Create tuples of (input, output, score) and sort by input text
-        samples = list(zip(inputs, outputs, scores))
+        # Create tuples of (input, output, score, ground_truth, correct)
+        if ground_truths is None:
+            ground_truths = ["N/A"] * len(inputs)
+        if correct is None:
+            correct = [False] * len(inputs)
+        
+        samples = list(zip(inputs, outputs, scores, ground_truths, correct))
         samples.sort(key=lambda x: x[0])  # Sort by input text
 
         # Use fixed random seed for deterministic shuffling
@@ -602,8 +635,63 @@ class RayPPOTrainer:
         # Take first N samples after shuffling
         samples = samples[:generations_to_log]
 
-        # Log to each configured logger
+        # Log to each configured logger (including Comet ML)
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+    
+    def _print_validation_table(self, samples):
+        """Print validation results as a table to console"""
+        try:
+            from tabulate import tabulate
+        except ImportError:
+            # Fallback to simple printing if tabulate is not available
+            print("\n" + "="*80)
+            print("VALIDATION RESULTS")
+            print("="*80)
+            for i, sample in enumerate(samples):
+                if len(sample) >= 5:
+                    task, llm_answer, score, ground_truth, correct = sample[:5]
+                    print(f"\nSample {i+1}:")
+                    print(f"  Task: {task[:100]}..." if len(task) > 100 else f"  Task: {task}")
+                    print(f"  LLM Answer: {llm_answer[:100]}..." if len(llm_answer) > 100 else f"  LLM Answer: {llm_answer}")
+                    print(f"  Ground Truth: {ground_truth}")
+                    print(f"  Correct: {'✓' if correct else '✗'}")
+                    print(f"  Score: {score}")
+                else:
+                    print(f"\nSample {i+1}: {sample}")
+            print("="*80 + "\n")
+            return
+        
+        # Create table data
+        table_data = []
+        for i, sample in enumerate(samples):
+            if len(sample) >= 5:
+                task, llm_answer, score, ground_truth, correct = sample[:5]
+                # Truncate long texts for display
+                task_display = task[:80] + "..." if len(task) > 80 else task
+                llm_answer_display = llm_answer[:80] + "..." if len(llm_answer) > 80 else llm_answer
+                ground_truth_display = str(ground_truth)[:80] + "..." if len(str(ground_truth)) > 80 else str(ground_truth)
+                table_data.append([
+                    i + 1,
+                    task_display,
+                    llm_answer_display,
+                    ground_truth_display,
+                    "✓" if correct else "✗"
+                ])
+            else:
+                table_data.append([
+                    i + 1,
+                    str(sample[0])[:80] if len(sample) > 0 else "N/A",
+                    str(sample[1])[:80] if len(sample) > 1 else "N/A",
+                    "N/A",
+                    "N/A"
+                ])
+        
+        headers = ["#", "Task", "LLM Answer", "Ground Truth", "Correct"]
+        print("\n" + "="*120)
+        print("VALIDATION RESULTS TABLE")
+        print("="*120)
+        print(tabulate(table_data, headers=headers, tablefmt="grid", maxcolwidths=[5, 40, 40, 40, 10]))
+        print("="*120 + "\n")
 
     def _validate(self):
         data_source_lst = []
@@ -613,6 +701,8 @@ class RayPPOTrainer:
         sample_inputs = []
         sample_outputs = []
         sample_scores = []
+        sample_ground_truths = []
+        sample_correct = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -672,6 +762,41 @@ class RayPPOTrainer:
 
             test_batch = test_batch.union(test_output_gen_batch)
 
+            # Extract ground truth answers from test_batch before evaluation
+            # Try different possible field names for ground truth
+            ground_truths = []
+            for i in range(len(test_batch)):
+                gt = None
+                # Check various possible locations for ground truth
+                if "answer" in test_batch[i].non_tensor_batch:
+                    gt = str(test_batch[i].non_tensor_batch["answer"])
+                elif "solution" in test_batch[i].non_tensor_batch:
+                    gt = str(test_batch[i].non_tensor_batch["solution"])
+                elif "target" in test_batch[i].non_tensor_batch:
+                    gt = str(test_batch[i].non_tensor_batch["target"])
+                elif "ground_truth" in test_batch[i].non_tensor_batch:
+                    gt = str(test_batch[i].non_tensor_batch["ground_truth"])
+                elif "reward_model" in test_batch[i].non_tensor_batch:
+                    rm_info = test_batch[i].non_tensor_batch["reward_model"]
+                    if isinstance(rm_info, dict):
+                        if "answer" in rm_info:
+                            gt = str(rm_info["answer"])
+                        elif "solution" in rm_info:
+                            gt = str(rm_info["solution"])
+                        elif "target" in rm_info:
+                            gt = str(rm_info["target"])
+                
+                # If still not found, try to get from reward_extra_info later
+                if gt is None:
+                    gt = "N/A"
+                ground_truths.append(gt)
+            
+            # Extend ground_truths for repeated samples
+            if self.config.actor_rollout_ref.rollout.val_kwargs.n > 1:
+                ground_truths = [gt for gt in ground_truths for _ in range(self.config.actor_rollout_ref.rollout.val_kwargs.n)]
+            
+            sample_ground_truths.extend(ground_truths)
+
             # evaluate using reward_function
             result = self.val_reward_fn(test_batch, return_dict=True)
             reward_tensor = result["reward_tensor"]
@@ -682,10 +807,30 @@ class RayPPOTrainer:
             if "reward_extra_info" in result:
                 for key, lst in result["reward_extra_info"].items():
                     reward_extra_infos_dict[key].extend(lst)
+                    # Try to extract ground truth from reward_extra_info if not found earlier
+                    if key in ["answer", "solution", "target", "ground_truth"]:
+                        # Update ground truths if they were "N/A"
+                        start_idx = len(sample_ground_truths) - len(output_texts)
+                        for idx, gt in enumerate(lst):
+                            if start_idx + idx < len(sample_ground_truths) and sample_ground_truths[start_idx + idx] == "N/A":
+                                sample_ground_truths[start_idx + idx] = str(gt)
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+            
+            # Compute correctness for this batch
+            for i, (output, gt) in enumerate(zip(output_texts, ground_truths)):
+                # Simple string matching for correctness (can be improved)
+                # For GSM8K, we typically extract the final number from the answer
+                is_correct = self._check_answer_correctness(output, gt)
+                sample_correct.append(is_correct)
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        self._maybe_log_val_generations(
+            inputs=sample_inputs, 
+            outputs=sample_outputs, 
+            scores=sample_scores,
+            ground_truths=sample_ground_truths,
+            correct=sample_correct
+        )
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)

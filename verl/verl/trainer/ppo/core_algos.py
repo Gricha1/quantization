@@ -516,8 +516,8 @@ def compute_vtrace_advantage_return(
             shape: (bs, response_length) - log probs under current policy π
         rollout_log_probs: `(torch.Tensor)`
             shape: (bs, response_length) - log probs under behavior policy μ
-        gamma: `(float)`
-            discount factor
+        gamma: `(float or torch.Tensor)`
+            discount factor (will be converted to tensor if float)
         rho_bar: `(float)`
             truncation threshold for importance weights (default: 1.0)
         c_bar: `(float)`
@@ -530,13 +530,28 @@ def compute_vtrace_advantage_return(
             shape: (bs, response_length) - V-trace returns
     """
     with torch.no_grad():
+        # Ensure gamma is a tensor
+        if isinstance(gamma, (int, float)):
+            gamma = torch.tensor(gamma, device=values.device, dtype=values.dtype)
+        
         # Compute importance ratios: π(a_t|s_t) / μ(a_t|s_t) = exp(log π - log μ)
         log_ratio = old_log_probs - rollout_log_probs
+        # Clip log_ratio to prevent numerical instability
+        # Softer clipping to allow policy changes while preventing extreme values
+        log_ratio = torch.clamp(log_ratio, min=-10.0, max=10.0)
         importance_ratio = torch.exp(log_ratio)
         
         # Truncated importance weights
         rho_t = torch.clamp(importance_ratio, max=rho_bar)
         c_t = torch.clamp(importance_ratio, max=c_bar)
+        
+        # Softer bounds: allow rho_t to be smaller (down to 0.01) to allow policy changes
+        # Only cap maximum if rho_bar is too high
+        if rho_bar > 2.0:
+            rho_t = torch.clamp(rho_t, min=0.01, max=2.0)
+        else:
+            # Allow rho_t to be as small as needed (down to 0.01) for policy changes
+            rho_t = torch.clamp(rho_t, min=0.01)
         
         # Initialize V-trace values
         gen_len = token_level_rewards.shape[-1]
@@ -545,12 +560,12 @@ def compute_vtrace_advantage_return(
         # Compute V-trace backwards (recursive form)
         # v_t = V(s_t) + ρ_t * (r_t + γv_{t+1} - V(s_t))
         # We iterate backwards and use the computed v_{t+1} for the next step
+        # Note: Similar to GAE, we compute for all tokens and apply mask only at the end
         for t in reversed(range(gen_len)):
             # Get current values
             v_t = values[:, t]
             r_t = token_level_rewards[:, t]
             rho = rho_t[:, t]
-            mask_t = response_mask[:, t]
             
             # For last timestep, v_next = 0, otherwise use computed v_trace from next step
             if t < gen_len - 1:
@@ -558,23 +573,55 @@ def compute_vtrace_advantage_return(
             else:
                 v_next_t = torch.zeros_like(v_t)
             
-            # TD error: δ_t = r_t + γV(s_{t+1}) - V(s_t)
-            # But in V-trace we use v_{t+1} instead of V(s_{t+1})
+            # TD error: δ_t = r_t + γv_{t+1} - V(s_t)
+            # Note: We use v_{t+1} (V-trace corrected) instead of V(s_{t+1})
             delta_t = r_t + gamma * v_next_t - v_t
             
             # V-trace update: v_t = V(s_t) + ρ_t * (r_t + γv_{t+1} - V(s_t))
+            # Softer clipping to allow larger corrections while preventing extreme values
+            delta_t = torch.clamp(delta_t, min=-50.0, max=50.0)
             v_trace_t = v_t + rho * delta_t
             
-            # Apply mask: only update for valid tokens
-            v_trace_values[:, t] = v_trace_t * mask_t + v_t * (1 - mask_t)
+            # Softer clipping for V-trace values to allow policy learning
+            # Still prevent extreme estimates but allow larger range
+            v_trace_t = torch.clamp(v_trace_t, min=-100.0, max=100.0)
+            
+            # Store V-trace value (mask will be applied later)
+            v_trace_values[:, t] = v_trace_t
         
         # Returns are V-trace values
-        returns = v_trace_values
+        # Apply mask to returns (similar to GAE - mask is applied after computation)
+        returns = v_trace_values * response_mask + values * (1 - response_mask)
+        
+        # Softer clipping for returns to allow policy learning
+        # Still prevent extreme values but allow larger range for critic learning
+        returns = torch.clamp(returns, min=-100.0, max=100.0)
+        
+        # Normalize returns to prevent critic overestimation
+        # This centers returns around their mean, similar to how GAE normalizes advantages
+        # This helps stabilize critic learning when V-trace overestimates returns
+        returns_mean = verl_F.masked_mean(returns, response_mask)
+        returns = returns - returns_mean
         
         # Advantages = returns - baseline (values)
         advantages = returns - values
         
+        # Apply mask to advantages (zero out invalid tokens)
+        advantages = advantages * response_mask
+        
+        # Check for NaN or Inf before normalization
+        if torch.any(torch.isnan(advantages)) or torch.any(torch.isinf(advantages)):
+            # Fallback: use simple advantages without V-trace correction
+            advantages = (v_trace_values - values) * response_mask
+            # Replace NaN/Inf with zeros
+            advantages = torch.where(
+                torch.isnan(advantages) | torch.isinf(advantages),
+                torch.zeros_like(advantages),
+                advantages
+            )
+        
         # Normalize advantages (similar to GAE)
+        # masked_whiten handles the mask internally
         advantages = verl_F.masked_whiten(advantages, response_mask)
     
     return advantages, returns
