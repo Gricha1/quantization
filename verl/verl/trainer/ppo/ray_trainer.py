@@ -19,7 +19,11 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import logging
 import os
+import queue
+import threading
+import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -43,6 +47,7 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, Ra
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.rollout_buffer import RolloutBuffer
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -959,6 +964,11 @@ class RayPPOTrainer:
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
+        self.async_rollout_buffer = None
+        self.rollout_generation_thread = None
+        self.prompt_queue = None
+        self.stop_rollout_generation = None
+        
         if self.config.actor_rollout_ref.rollout.mode == "async":
             from verl.workers.rollout.async_server import AsyncLLMServerManager
 
@@ -967,6 +977,82 @@ class RayPPOTrainer:
                 config=self.config,
                 worker_group=self.actor_rollout_wg,
             )
+            
+            # Initialize rollout buffer for async mode with pipeline
+            async_pipeline = self.config.trainer.get("async_rollout_pipeline", False)
+            if async_pipeline:
+                buffer_size = self.config.trainer.get("async_rollout_buffer_size", 10)
+                self.async_rollout_buffer = RolloutBuffer(max_size=buffer_size)
+                self.prompt_queue = queue.Queue(maxsize=buffer_size * 2)
+                self.stop_rollout_generation = threading.Event()
+                logging.info(f"Initialized async rollout buffer with size {buffer_size}")
+
+    def _start_rollout_generation_thread(self):
+        """
+        Start background thread that continuously generates rollouts and adds them to buffer.
+        """
+        if self.rollout_generation_thread is not None:
+            return  # Already started
+        
+        def rollout_generation_worker():
+            """Background worker that generates rollouts from prompt queue."""
+            while not self.stop_rollout_generation.is_set():
+                try:
+                    # Get prompt from queue (with timeout to check stop flag)
+                    try:
+                        gen_batch = self.prompt_queue.get(timeout=1.0)
+                    except queue.Empty:
+                        continue
+                    
+                    # Generate rollout asynchronously
+                    try:
+                        rollout_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                        # Add to buffer
+                        self.async_rollout_buffer.add(rollout_output, step=self.global_steps)
+                    except Exception as e:
+                        logging.error(f"Error generating rollout in background thread: {e}", exc_info=True)
+                except Exception as e:
+                    logging.error(f"Error in rollout generation thread: {e}", exc_info=True)
+        
+        self.rollout_generation_thread = threading.Thread(target=rollout_generation_worker, daemon=True)
+        self.rollout_generation_thread.start()
+        logging.info("Started background rollout generation thread")
+    
+    def _stop_rollout_generation_thread(self):
+        """Stop the background rollout generation thread."""
+        if self.rollout_generation_thread is not None:
+            self.stop_rollout_generation.set()
+            self.rollout_generation_thread.join(timeout=5.0)
+            if self.rollout_generation_thread.is_alive():
+                logging.warning("Rollout generation thread did not stop gracefully")
+            self.rollout_generation_thread = None
+            logging.info("Stopped background rollout generation thread")
+    
+    def _pop_for_generation(self, dp: DataProto):
+        """Extract generation batch from DataProto (class method for buffer usage)."""
+        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+        if "multi_modal_data" in dp.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("multi_modal_data")
+        # Note: For async rollout mode, we need to keep "raw_prompt" as chat_scheduler requires it
+        if not self.async_rollout_mode:
+            if "raw_prompt" in dp.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("raw_prompt")
+        if "tools_kwargs" in dp.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("tools_kwargs")
+        gen_dp = dp.pop(batch_keys=batch_keys_to_pop, non_tensor_batch_keys=non_tensor_batch_keys_to_pop)
+        
+        # For async rollout mode, ensure raw_prompt exists (chat_scheduler requires it)
+        if self.async_rollout_mode:
+            if "raw_prompt" not in gen_dp.non_tensor_batch:
+                import numpy as np
+                if gen_dp.batch is not None and "input_ids" in gen_dp.batch:
+                    input_ids = gen_dp.batch["input_ids"]
+                    input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+                    conversations = [[{"role": "user", "content": text}] for text in input_texts]
+                    gen_dp.non_tensor_batch["raw_prompt"] = np.array(conversations, dtype=object)
+        
+        return dp, gen_dp
 
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
@@ -1108,6 +1194,7 @@ class RayPPOTrainer:
         async_pipeline = bool(self.config.trainer.get("async_rollout_pipeline", False)) and self.async_rollout_mode
         # In async_pipeline mode, we overlap rollout for step t+1 with learner updates for step t.
         # This uses AsyncLLMServerManager.generate_sequences_async() (non-blocking Future).
+        use_buffer = async_pipeline and self.async_rollout_mode and self.async_rollout_buffer is not None
 
         def _pop_for_generation(dp: DataProto):
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -1142,13 +1229,32 @@ class RayPPOTrainer:
         try:
             if async_pipeline:
                 self.async_rollout_manager.wake_up()
+            
+            # Start background rollout generation thread if using buffer
+            if use_buffer:
+                self._start_rollout_generation_thread()
+                # Pre-fill prompt queue with initial batches
+                prefetch_iter = iter(self.train_dataloader)
+                min_buffer_size = self.config.trainer.get("async_rollout_min_buffer_size", 2)
+                for _ in range(min_buffer_size):
+                    try:
+                        batch_dict = next(prefetch_iter)
+                        batch = DataProto.from_single_dict(batch_dict)
+                        _, gen_batch = self._pop_for_generation(batch)
+                        try:
+                            self.prompt_queue.put(gen_batch, timeout=1.0)
+                        except queue.Full:
+                            break
+                    except StopIteration:
+                        break
 
             for epoch in range(self.config.trainer.total_epochs):
                 train_iter = iter(self.train_dataloader)
                 
-                # For async pipeline mode, we need a separate iterator for prefetching
-                # to avoid consuming batches from the main loop iterator
-                if async_pipeline:
+                # For async pipeline mode with buffer, we need a separate iterator for feeding prompts
+                if use_buffer:
+                    prompt_feeder_iter = iter(self.train_dataloader)
+                elif async_pipeline:
                     # Create a separate iterator for prefetching
                     prefetch_iter = iter(self.train_dataloader)
                     # Prefetch first batch
@@ -1175,7 +1281,34 @@ class RayPPOTrainer:
                     with _timer("step", timing_raw):
                         # generate a batch
                         with _timer("gen", timing_raw):
-                            if async_pipeline:
+                            if use_buffer:
+                                # Get rollout from buffer (non-blocking)
+                                min_buffer_size = self.config.trainer.get("async_rollout_min_buffer_size", 2)
+                                
+                                # Wait for buffer to have enough rollouts
+                                while self.async_rollout_buffer.size() < min_buffer_size:
+                                    time.sleep(0.01)  # Small sleep to avoid busy waiting
+                                
+                                # Sample rollout from buffer
+                                rollout_samples = self.async_rollout_buffer.sample(batch_size=1)
+                                if len(rollout_samples) == 0:
+                                    # Fallback: generate synchronously if buffer is empty
+                                    logging.warning("Buffer empty, generating synchronously")
+                                    gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                                else:
+                                    gen_batch_output = rollout_samples[0]['data']
+                                
+                                # Add current prompt to queue for background generation
+                                try:
+                                    self.prompt_queue.put(gen_batch, timeout=0.1)
+                                except queue.Full:
+                                    pass  # Queue is full, skip
+                                
+                                # Log buffer statistics periodically
+                                if self.global_steps % 10 == 0:
+                                    buffer_stats = self.async_rollout_buffer.get_stats()
+                                    logging.info(f"Buffer stats: {buffer_stats}")
+                            elif async_pipeline:
                                 # In async pipeline mode, if we have a prefetched future, use it
                                 # Otherwise start rollout for current batch
                                 if next_rollout_future is not None:
@@ -1190,12 +1323,24 @@ class RayPPOTrainer:
                                 self.async_rollout_manager.wake_up()
                                 gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                                 self.async_rollout_manager.sleep()
-                            timing_raw.update(gen_batch_output.meta_info["timing"])
+                            timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
                             gen_batch_output.meta_info.pop("timing", None)
 
-                        # In async_pipeline mode, prefetch next batch rollout BEFORE learner updates
-                        # This allows rollout to run concurrently while we update actor/critic
-                        if async_pipeline and (not is_last_step) and next_batch_dict is not None:
+                        # In async_pipeline mode with buffer, feed next prompt to queue
+                        # In async_pipeline mode without buffer, prefetch next batch rollout BEFORE learner updates
+                        if use_buffer and (not is_last_step):
+                            # Feed next prompt to queue for background generation
+                            try:
+                                next_batch_dict = next(prompt_feeder_iter)
+                                next_batch = DataProto.from_single_dict(next_batch_dict)
+                                _, next_gen_batch = self._pop_for_generation(next_batch)
+                                try:
+                                    self.prompt_queue.put(next_gen_batch, timeout=0.1)
+                                except queue.Full:
+                                    pass  # Queue is full, skip
+                            except StopIteration:
+                                pass  # No more batches
+                        elif async_pipeline and (not is_last_step) and next_batch_dict is not None:
                             # Prepare next batch for async rollout using _pop_for_generation
                             next_batch = DataProto.from_single_dict(next_batch_dict)
                             _, next_gen_batch = _pop_for_generation(next_batch)
@@ -1381,18 +1526,11 @@ class RayPPOTrainer:
                                     dump_path=rollout_data_dir,
                                 )
 
-                        if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
-                            with _timer("testing", timing_raw):
-                                val_metrics: dict = self._validate()
-                                if is_last_step:
-                                    last_val_metrics = val_metrics
-                            metrics.update(val_metrics)
-
                         if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
                             with _timer("save_checkpoint", timing_raw):
                                 self._save_checkpoint()
 
-                    # validate
+                    # validate after each batch (not just after critic warmup)
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
                         with _timer("testing", timing_raw):
                             val_metrics: dict = self._validate()
@@ -1431,6 +1569,10 @@ class RayPPOTrainer:
                     return
 
         finally:
+            # Stop background rollout generation thread if using buffer
+            if use_buffer:
+                self._stop_rollout_generation_thread()
+            
             if async_pipeline:
                 # Best-effort cleanup: offload/discard kv cache after training loop.
                 try:

@@ -179,6 +179,8 @@ python -m verl.trainer.main_ppo \
   trainer.nnodes=1 \
   trainer.val_before_train=True \
   trainer.async_rollout_pipeline=true \
+  +trainer.async_rollout_buffer_size=10 \
+  +trainer.async_rollout_min_buffer_size=2 \
   trainer.save_freq=20 \
   trainer.test_freq=10 \
   trainer.total_epochs=30 \
