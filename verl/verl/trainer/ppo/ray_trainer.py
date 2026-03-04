@@ -724,14 +724,33 @@ class RayPPOTrainer:
             non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
             if "multi_modal_data" in test_batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("multi_modal_data")
-            if "raw_prompt" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("raw_prompt")
+            # Note: For async rollout mode, we need to keep "raw_prompt" as chat_scheduler requires it
+            # Only remove it if not using async rollout mode
+            if not self.async_rollout_mode:
+                if "raw_prompt" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("raw_prompt")
             if "tools_kwargs" in test_batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("tools_kwargs")
             test_gen_batch = test_batch.pop(
                 batch_keys=batch_keys_to_pop,
                 non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
             )
+            
+            # For async rollout mode, ensure raw_prompt exists (chat_scheduler requires it)
+            if self.async_rollout_mode:
+                if "raw_prompt" not in test_gen_batch.non_tensor_batch:
+                    # Restore raw_prompt from input_texts if missing
+                    import numpy as np
+                    # Convert input_texts to conversation format
+                    # Each text becomes a conversation: [{"role": "user", "content": text}]
+                    conversations = []
+                    n_repeat = self.config.actor_rollout_ref.rollout.val_kwargs.n
+                    for text in input_texts:
+                        # Repeat each conversation n_repeat times if needed
+                        for _ in range(n_repeat):
+                            conversations.append([{"role": "user", "content": text}])
+                    # Create numpy array of conversations (each element is a list)
+                    test_gen_batch.non_tensor_batch["raw_prompt"] = np.array(conversations, dtype=object)
 
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
@@ -1095,11 +1114,29 @@ class RayPPOTrainer:
             non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
             if "multi_modal_data" in dp.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("multi_modal_data")
-            if "raw_prompt" in dp.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("raw_prompt")
+            # Note: For async rollout mode, we need to keep "raw_prompt" as chat_scheduler requires it
+            # Only remove it if not using async rollout mode
+            if not self.async_rollout_mode:
+                if "raw_prompt" in dp.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("raw_prompt")
             if "tools_kwargs" in dp.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("tools_kwargs")
             gen_dp = dp.pop(batch_keys=batch_keys_to_pop, non_tensor_batch_keys=non_tensor_batch_keys_to_pop)
+            
+            # For async rollout mode, ensure raw_prompt exists (chat_scheduler requires it)
+            if self.async_rollout_mode:
+                if "raw_prompt" not in gen_dp.non_tensor_batch:
+                    # Restore raw_prompt from input_ids if missing
+                    import numpy as np
+                    # Check if batch exists and has input_ids (TensorDict cannot be used in boolean context)
+                    if gen_dp.batch is not None and "input_ids" in gen_dp.batch:
+                        input_ids = gen_dp.batch["input_ids"]
+                        # Decode input_ids to text
+                        input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+                        # Convert to conversation format: [{"role": "user", "content": text}]
+                        conversations = [[{"role": "user", "content": text}] for text in input_texts]
+                        gen_dp.non_tensor_batch["raw_prompt"] = np.array(conversations, dtype=object)
+            
             return dp, gen_dp
 
         try:
@@ -1130,19 +1167,8 @@ class RayPPOTrainer:
                     timing_raw = {}
                     batch: DataProto = DataProto.from_single_dict(batch_dict)
 
-                    # pop those keys for generation
-                    batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-                    non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-                    if "multi_modal_data" in batch.non_tensor_batch:
-                        non_tensor_batch_keys_to_pop.append("multi_modal_data")
-                    if "raw_prompt" in batch.non_tensor_batch:
-                        non_tensor_batch_keys_to_pop.append("raw_prompt")
-                    if "tools_kwargs" in batch.non_tensor_batch:
-                        non_tensor_batch_keys_to_pop.append("tools_kwargs")
-                    gen_batch = batch.pop(
-                        batch_keys=batch_keys_to_pop,
-                        non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-                    )
+                    # Prepare batch for generation
+                    batch, gen_batch = _pop_for_generation(batch)
 
                     is_last_step = self.global_steps >= self.total_training_steps
 
@@ -1170,12 +1196,9 @@ class RayPPOTrainer:
                         # In async_pipeline mode, prefetch next batch rollout BEFORE learner updates
                         # This allows rollout to run concurrently while we update actor/critic
                         if async_pipeline and (not is_last_step) and next_batch_dict is not None:
-                            # Prepare next batch for async rollout
+                            # Prepare next batch for async rollout using _pop_for_generation
                             next_batch = DataProto.from_single_dict(next_batch_dict)
-                            next_gen_batch = next_batch.pop(
-                                batch_keys=batch_keys_to_pop,
-                                non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-                            )
+                            _, next_gen_batch = _pop_for_generation(next_batch)
                             # Start async rollout for next batch (non-blocking)
                             next_rollout_future = self.async_rollout_manager.generate_sequences_async(next_gen_batch)
                             
@@ -1211,6 +1234,14 @@ class RayPPOTrainer:
                         # repeat to align with repeated responses in rollout
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                         batch = batch.union(gen_batch_output)
+
+                        # For async rollout mode, compute rollout_log_probs if missing
+                        # (async rollout may not include them in gen_batch_output)
+                        if self.async_rollout_mode and "rollout_log_probs" not in batch.batch:
+                            # Compute rollout_log_probs using actor_rollout_wg (behavior policy)
+                            # Note: compute_log_prob returns old_log_probs, which we use as rollout_log_probs
+                            rollout_log_prob_output = self.actor_rollout_wg.compute_log_prob(batch)
+                            batch.batch["rollout_log_probs"] = rollout_log_prob_output.batch["old_log_probs"]
 
                         batch.batch["response_mask"] = compute_response_mask(batch)
                         # Balance the number of valid tokens across DP ranks.

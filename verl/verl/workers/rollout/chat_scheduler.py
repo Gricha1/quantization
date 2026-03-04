@@ -17,6 +17,7 @@ import importlib
 import itertools
 import json
 import logging
+import os
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List
@@ -50,7 +51,7 @@ class CompletionCallback(ABC):
         tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
         self.tools = {tool.name: tool for tool in tool_list}
         self._tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
-        print(f"Initialized tools: {self.tools}", flush=True)
+        logger.debug(f"Initialized tools: {self.tools}")
 
         local_path = copy_to_local(config.actor_rollout_ref.model.path)
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
@@ -108,23 +109,23 @@ class ToolCompletionCallback(CompletionCallback):
 
         # STEP 0: check if we reach max turns
         if self.max_turns and len(messages) >= self.max_turns:
-            print(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] Reach max turns, done!")
+            logger.debug(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] Reach max turns, done!")
             return
 
         # STEP 1: check if the model called tools
         if finish_reason != "tool_calls":
-            print(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] No tool called, done!")
+            logger.debug(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] No tool called, done!")
             return
 
         # STEP 2: call tools
         tool_calls = completions.choices[0].message.tool_calls
-        print(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] Call {len(tool_calls)} tools")
+        logger.debug(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] Call {len(tool_calls)} tools")
         tasks = []
         for tool_call in tool_calls:
             tasks.append(self._call_tool(tool_call))
         tool_responses = await asyncio.gather(*tasks)
         if any(isinstance(item, Exception) for item in tool_responses):
-            print(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] Error when calling tools, done!")
+            logger.debug(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] Error when calling tools, done!")
             return
         messages.extend(tool_responses)
 
@@ -262,6 +263,10 @@ class ChatCompletionScheduler:
             server_addresses: List[str], OpenAI compatible server addresses.
             max_cache_size: int, max cache size of request_id to address mapping.
         """
+        # Set logging level based on VERL_LOGGING_LEVEL environment variable
+        verl_log_level = os.environ.get("VERL_LOGGING_LEVEL", "INFO")
+        logger.setLevel(getattr(logging, verl_log_level.upper(), logging.INFO))
+        
         self.config = config.actor_rollout_ref.rollout
         model_path = config.actor_rollout_ref.model.path
         self.model_name = "/".join(model_path.split("/")[-2:])
@@ -380,7 +385,7 @@ class ChatCompletionScheduler:
             kwargs["top_p"] = self.config.val_kwargs.top_p
             kwargs["temperature"] = self.config.val_kwargs.temperature
 
-        print(f"[ChatCompletionScheduler] generate_sequences sampling params: {kwargs}")
+        logger.debug(f"[ChatCompletionScheduler] generate_sequences sampling params: {kwargs}")
 
         # NOTE: For multi-turn rollout, repeat raw_prompt n times and process each prompt independently,
         # validation dataset has already been repeated in `PPOTrainer._validate`.
@@ -403,7 +408,7 @@ class ChatCompletionScheduler:
         await asyncio.gather(*tasks)
         output_batch = self.completion_callback.postprocess(batch, batch_conversations, n=n)
         output_batch.meta_info["timing"] = {"generate_sequences": time.time() - t_start}
-        print("[ChatCompletionScheduler] generate_sequences done")
+        logger.debug("[ChatCompletionScheduler] generate_sequences done")
         return output_batch
 
     async def _submit_chat_completions_semaphore(self, messages: List[Dict[str, str]], request_id: str, sampling_params: Dict[str, Any]):
