@@ -17,6 +17,7 @@ import os
 import socket
 import threading
 from abc import ABC, abstractmethod
+from concurrent.futures import Future
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Tuple, Type
 
@@ -208,6 +209,15 @@ class AsyncLLMServerManager:
 
         future = asyncio.run_coroutine_threadsafe(self.chat_scheduler.generate_sequences(prompts, **sampling_params), self.chat_scheduler_loop)
         return future.result()
+
+    def generate_sequences_async(self, prompts: DataProto, **sampling_params) -> Future:
+        """Generate multiple sequences in parallel via chat scheduler (non-blocking).
+
+        Returns:
+            concurrent.futures.Future: A future that resolves to a DataProto.
+        """
+        assert self.chat_scheduler is not None, "chat scheduler is not initialized."
+        return asyncio.run_coroutine_threadsafe(self.chat_scheduler.generate_sequences(prompts, **sampling_params), self.chat_scheduler_loop)
 
 
 def async_server_class(rollout_backend: str) -> Type[AsyncServerBase]:

@@ -465,6 +465,9 @@ actor_rollout_ref:
       # null for default callback
       completion_callback: null
 
+      # Tool parsing format (hermes, llama3_json, etc.) - used in async rollout mode
+      format: null
+
       # - When set to True, the model's default chat template is used for multi-turn rollout, which typically matches production behavior.
       # - When set to False, the token ids recorded for training are used instead; unlike the default chat template, these always include the model's full output,
       #   which may contain additional content such as reasoning content. This maintains the consistency between training and rollout, but it will lead to longer prompts.
@@ -839,6 +842,11 @@ trainer:
 
   # Validation frequency (in training iterations)
   test_freq: -1
+
+  # Enable async rollout pipeline mode: overlap rollout for batch t+1 with learner updates for batch t
+  # Requires actor_rollout_ref.rollout.mode=async to be enabled
+  # When True, rollout for next batch starts before learner updates, allowing parallel execution
+  async_rollout_pipeline: false
 
   # Number of iterations to warm up the critic before updating policy
   critic_warmup: 0

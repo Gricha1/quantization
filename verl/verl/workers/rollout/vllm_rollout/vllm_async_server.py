@@ -162,12 +162,19 @@ class AsyncvLLMServer(AsyncServerBase):
                 kwargs[k] = config.get(k)
         print(f"override_generation_config: {kwargs}")
 
+        # Determine distributed executor backend
+        use_ray_backend = os.environ.get("VERL_VLLM_USE_RAY_BACKEND", "1") == "1"
+        distributed_executor_backend = ExternalRayDistributedExecutor if use_ray_backend else None
+        
+        logger.info(f"Initializing AsyncLLM engine with distributed_executor_backend={distributed_executor_backend}, "
+                   f"tensor_parallel_size={tensor_parallel_size}, gpu_memory_utilization={config.gpu_memory_utilization}")
+        
         engine_args = AsyncEngineArgs(
             model=local_path,
             enable_sleep_mode=True,
             override_generation_config=kwargs,
             tensor_parallel_size=tensor_parallel_size,
-            distributed_executor_backend=ExternalRayDistributedExecutor if os.environ.get("VERL_VLLM_USE_RAY_BACKEND", "1") == "1" else None,
+            distributed_executor_backend=distributed_executor_backend,
             dtype=config.dtype,
             enforce_eager=config.enforce_eager,
             gpu_memory_utilization=config.gpu_memory_utilization,
@@ -185,15 +192,35 @@ class AsyncvLLMServer(AsyncServerBase):
         )
 
         # init async llm engine
-        vllm_config = engine_args.create_engine_config()
-        namespace = ray.get_runtime_context().namespace
-        vllm_config.instance_id = f"{namespace}:{self.wg_prefix}:{self.vllm_dp_size}:{self.vllm_dp_rank}"
-        self.engine = AsyncLLM.from_vllm_config(vllm_config)
+        try:
+            vllm_config = engine_args.create_engine_config()
+            namespace = ray.get_runtime_context().namespace
+            vllm_config.instance_id = f"{namespace}:{self.wg_prefix}:{self.vllm_dp_size}:{self.vllm_dp_rank}"
+            logger.info(f"Creating AsyncLLM with instance_id={vllm_config.instance_id}")
+            self.engine = AsyncLLM.from_vllm_config(vllm_config)
+            logger.info("AsyncLLM engine created successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize AsyncLLM engine: {e}", exc_info=True)
+            raise RuntimeError(f"Failed to initialize AsyncLLM engine: {e}") from e
 
         # build serving chat
         model_config = self.engine.model_config
         BASE_MODEL_PATHS = [BaseModelPath(name=model_name, model_path=model_path)]
         models = OpenAIServingModels(self.engine, model_config, BASE_MODEL_PATHS)
+        
+        # Get tool_parser from config, but only if it's not None/empty
+        # If multi_turn is disabled or format is None, disable auto_tools
+        tool_parser = None
+        enable_auto_tools = False
+        
+        if hasattr(config.multi_turn, 'format') and config.multi_turn.format is not None:
+            format_str = str(config.multi_turn.format).strip()
+            if format_str and format_str.lower() not in ('none', 'null', ''):
+                tool_parser = format_str
+                enable_auto_tools = True
+        
+        # Only enable auto_tools if we have a valid tool_parser
+        # vLLM requires tool_parser to be registered when enable_auto_tools=True
         self.openai_serving_chat = OpenAIServingChat(
             self.engine,
             model_config,
@@ -202,8 +229,8 @@ class AsyncvLLMServer(AsyncServerBase):
             request_logger=RequestLogger(max_log_len=4096),
             chat_template=None,
             chat_template_content_format="auto",
-            enable_auto_tools=True,
-            tool_parser=config.multi_turn.format,  # hermes, llama3_json, ...
+            enable_auto_tools=enable_auto_tools,
+            tool_parser=tool_parser,  # hermes, llama3_json, ... or None if not specified
         )
 
     async def chat_completion(self, raw_request: Request):
