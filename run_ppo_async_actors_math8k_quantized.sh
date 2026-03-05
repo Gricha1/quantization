@@ -155,7 +155,7 @@ python -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
   actor_rollout_ref.actor.use_kl_loss=False \
   actor_rollout_ref.actor.imp_ratio_cap=5 \
-  actor_rollout_ref.rollout.mode=async \
+  actor_rollout_ref.rollout.mode=sync \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
   actor_rollout_ref.rollout.name=vllm \

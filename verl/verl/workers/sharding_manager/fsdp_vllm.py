@@ -96,6 +96,10 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             self.gen_random_states = None
 
         self.base_sync_done: bool = "dummy" not in load_format
+        # Flag to indicate that weights need to be synchronized from learner
+        # Set to True by sync_rollout_weights() after learner updates
+        # Set to False by __enter__() after synchronizing weights
+        self._needs_weight_sync: bool = False
         if is_version_ge(pkg="vllm", minver="0.7.3"):
             VLLMHijack.hijack()
 
@@ -251,6 +255,107 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             return data
 
         return data.chunk(chunks=self.tp_size)[self.tp_rank]
+
+    def sync_rollout_weights(self):
+        """Explicitly synchronize weights from FSDP module to vLLM.
+        
+        This method should be called after learner updates to ensure rollouts
+        are generated with the latest policy weights. After synchronization,
+        sets _skip_weight_sync flag to True to skip redundant syncs in subsequent
+        generate_sequences calls.
+        """
+        def __collect_lora_params() -> OrderedDict:
+            """Collect lora params or full params if base model is not ready in vllm"""
+            from peft.utils.save_and_load import get_peft_model_state_dict
+
+            lora_params = OrderedDict()
+            peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
+            if fsdp_version(self.module) > 0:
+                if self.layered_summon:
+                    if not self.base_sync_done:
+                        raise ValueError("To use layered_summon, you must make sure base-model is preloaded in vllm, e.g. let rollout.load_format=safetensors")
+                    lora_params = layered_summon_lora_params(self.module)
+                else:
+                    with FSDP.summon_full_params(self.module, writeback=False):
+                        if self.base_sync_done:
+                            lora_params = get_peft_model_state_dict(peft_model)
+                            lora_params = {name: param.full_tensor().detach().cpu() if hasattr(param, "full_tensor") else param.detach().cpu() for name, param in lora_params.items()}
+                        else:
+                            model = peft_model.base_model.model
+                            orig_dev = "cpu" if "cpu" in str(next(model.parameters()).device) else "cuda"
+                            model = model.to("cpu")
+                            for name, param in model.state_dict().items():
+                                if any(x in name for x in ["_flat_param", "lora_"]):
+                                    continue
+                                name = name.replace("_fsdp_wrapped_module.", "").replace(".base_layer", "")
+                                lora_params[name] = param.full_tensor().detach().cpu() if hasattr(param, "full_tensor") else param.detach().cpu()
+                            model = model.to(orig_dev)
+                    torch.cuda.empty_cache()
+            else:
+                if self.base_sync_done:
+                    lora_params = get_peft_model_state_dict(peft_model)
+                else:
+                    model = peft_model.base_model.model
+                    orig_dev = "cpu" if "cpu" in str(next(model.parameters()).device) else "cuda"
+                    model = model.to("cpu")
+                    for name, param in model.state_dict().items():
+                        if any(x in name for x in ["_flat_param", "lora_"]):
+                            continue
+                        name = name.replace("_fsdp_wrapped_module.", "").replace(".base_layer", "")
+                        lora_params[name] = param.detach().cpu()
+                    model = model.to(orig_dev)
+            return lora_params
+
+        get_torch_device().empty_cache()
+        
+        if self.offload_param:
+            load_fsdp_model_to_gpu(self.module)
+
+        peft_config = None
+        peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
+        if hasattr(peft_model, "peft_config"):
+            peft_config = peft_model.peft_config.get("default", None)
+            params = __collect_lora_params()
+        else:
+            params = self.module.state_dict()
+        params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+
+        load_format = "hf" if self.full_params else "dtensor"
+
+        try:
+            if vllm_version in ("0.5.4", "0.6.3"):
+                self.inference_engine.sync_model_weights(params, load_format=load_format)
+                del params
+            else:
+                if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+                    self.inference_engine.wake_up(tags=["weights"])
+                else:
+                    self.inference_engine.wake_up()
+
+                self.update_params(params, peft_config=peft_config)
+                del params
+                if self.offload_param:
+                    offload_fsdp_model_to_cpu(self.module)
+                get_torch_device().empty_cache()
+
+                if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+                    self.inference_engine.wake_up(tags=["kv_cache"])
+
+            # Synchronize all processes to ensure weight sync is complete before continuing
+            import torch.distributed as dist
+            if dist.is_initialized():
+                dist.barrier()
+            
+            # Additional CUDA synchronization and memory cleanup
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                get_torch_device().empty_cache()
+        except Exception as e:
+            logger.error(f"Error in sync_rollout_weights: {e}", exc_info=True)
+            # Clean up memory on error
+            if torch.cuda.is_available():
+                get_torch_device().empty_cache()
+            raise
 
     def update_params(self, updated_params, peft_config=None):
         model = self.model_runner.model

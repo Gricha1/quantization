@@ -654,6 +654,18 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def sync_rollout_weights(self):
+        """Synchronize weights from learner to rollout vLLM engine.
+        
+        This method should be called after update_actor to ensure rollouts
+        are generated with the latest policy weights. It synchronizes weights
+        and sets a flag to skip redundant syncs in subsequent generate_sequences calls.
+        """
+        assert self._is_rollout
+        if hasattr(self, 'rollout_sharding_manager') and self.rollout_sharding_manager is not None:
+            self.rollout_sharding_manager.sync_rollout_weights()
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
@@ -1034,6 +1046,11 @@ class CriticWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_values(self, data: DataProto):
         # Support all hardwares
+        # Additional CUDA synchronization before moving data to GPU to avoid illegal memory access
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            get_torch_device().empty_cache()
+        
         data = data.to(get_torch_device().current_device())
 
         if self._is_offload_param:

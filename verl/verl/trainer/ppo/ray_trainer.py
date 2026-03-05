@@ -622,8 +622,6 @@ class RayPPOTrainer:
         if generations_to_log == 0:
             return
 
-        import numpy as np
-
         # Create tuples of (input, output, score, ground_truth, correct)
         if ground_truths is None:
             ground_truths = ["N/A"] * len(inputs)
@@ -745,7 +743,6 @@ class RayPPOTrainer:
             if self.async_rollout_mode:
                 if "raw_prompt" not in test_gen_batch.non_tensor_batch:
                     # Restore raw_prompt from input_texts if missing
-                    import numpy as np
                     # Convert input_texts to conversation format
                     # Each text becomes a conversation: [{"role": "user", "content": text}]
                     conversations = []
@@ -962,13 +959,17 @@ class RayPPOTrainer:
         self.actor_rollout_wg = all_wg["actor_rollout"]
         self.actor_rollout_wg.init_model()
 
-        # create async rollout manager and request scheduler
+        # Async rollout flags / infra
+        # async_rollout_mode == True только для AsyncLLM backend (rollout.mode == "async")
         self.async_rollout_mode = False
         self.async_rollout_buffer = None
         self.rollout_generation_thread = None
         self.prompt_queue = None
         self.stop_rollout_generation = None
-        
+
+        async_pipeline_cfg = self.config.trainer.get("async_rollout_pipeline", False)
+
+        # Вариант 1: AsyncLLM backend (старый путь)
         if self.config.actor_rollout_ref.rollout.mode == "async":
             from verl.workers.rollout.async_server import AsyncLLMServerManager
 
@@ -977,15 +978,26 @@ class RayPPOTrainer:
                 config=self.config,
                 worker_group=self.actor_rollout_wg,
             )
-            
+
             # Initialize rollout buffer for async mode with pipeline
-            async_pipeline = self.config.trainer.get("async_rollout_pipeline", False)
-            if async_pipeline:
+            if async_pipeline_cfg:
                 buffer_size = self.config.trainer.get("async_rollout_buffer_size", 10)
                 self.async_rollout_buffer = RolloutBuffer(max_size=buffer_size)
                 self.prompt_queue = queue.Queue(maxsize=buffer_size * 2)
                 self.stop_rollout_generation = threading.Event()
-                logging.info(f"Initialized async rollout buffer with size {buffer_size}")
+                logging.info(f"Initialized async rollout buffer with size {buffer_size} (AsyncLLM backend)")
+
+        # Вариант 2: threaded async поверх обычного rollout (вариант C)
+        else:
+            if async_pipeline_cfg:
+                buffer_size = self.config.trainer.get("async_rollout_buffer_size", 10)
+                self.async_rollout_buffer = RolloutBuffer(max_size=buffer_size)
+                self.prompt_queue = queue.Queue(maxsize=buffer_size * 2)
+                self.stop_rollout_generation = threading.Event()
+                logging.info(
+                    f"Initialized threaded async rollout buffer with size {buffer_size} "
+                    "using actor_rollout_wg.generate_sequences (sync rollout backend)"
+                )
 
     def _start_rollout_generation_thread(self):
         """
@@ -1003,10 +1015,16 @@ class RayPPOTrainer:
                         gen_batch = self.prompt_queue.get(timeout=1.0)
                     except queue.Empty:
                         continue
-                    
-                    # Generate rollout asynchronously
+
+                    # Generate rollout asynchronously:
+                    # - если async_rollout_mode == True → через AsyncLLM
+                    # - иначе → через обычный actor_rollout_wg (sync rollout backend)
                     try:
-                        rollout_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                        if self.async_rollout_mode:
+                            rollout_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                        else:
+                            rollout_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+
                         # Add to buffer
                         self.async_rollout_buffer.add(rollout_output, step=self.global_steps)
                     except Exception as e:
@@ -1045,7 +1063,6 @@ class RayPPOTrainer:
         # For async rollout mode, ensure raw_prompt exists (chat_scheduler requires it)
         if self.async_rollout_mode:
             if "raw_prompt" not in gen_dp.non_tensor_batch:
-                import numpy as np
                 if gen_dp.batch is not None and "input_ids" in gen_dp.batch:
                     input_ids = gen_dp.batch["input_ids"]
                     input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
@@ -1191,10 +1208,17 @@ class RayPPOTrainer:
         self.global_steps += 1
         last_val_metrics = None
 
-        async_pipeline = bool(self.config.trainer.get("async_rollout_pipeline", False)) and self.async_rollout_mode
-        # In async_pipeline mode, we overlap rollout for step t+1 with learner updates for step t.
-        # This uses AsyncLLMServerManager.generate_sequences_async() (non-blocking Future).
-        use_buffer = async_pipeline and self.async_rollout_mode and self.async_rollout_buffer is not None
+        # Async rollout pipeline configuration.
+        # async_rollout_mode == True: AsyncLLM backend
+        # async_rollout_mode == False and async_rollout_buffer is not None: threaded async over sync rollout (variant C).
+        async_pipeline_cfg = bool(self.config.trainer.get("async_rollout_pipeline", False))
+        if self.async_rollout_mode:
+            async_pipeline = async_pipeline_cfg
+        else:
+            async_pipeline = async_pipeline_cfg and self.async_rollout_buffer is not None
+
+        # use_buffer: both for AsyncLLM and threaded-async when buffer is available.
+        use_buffer = async_pipeline and self.async_rollout_buffer is not None
 
         def _pop_for_generation(dp: DataProto):
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -1214,7 +1238,18 @@ class RayPPOTrainer:
             if self.async_rollout_mode:
                 if "raw_prompt" not in gen_dp.non_tensor_batch:
                     # Restore raw_prompt from input_ids if missing
-                    import numpy as np
+                    # Check if batch exists and has input_ids (TensorDict cannot be used in boolean context)
+                    if gen_dp.batch is not None and "input_ids" in gen_dp.batch:
+                        input_ids = gen_dp.batch["input_ids"]
+                        # Decode input_ids to text
+                        input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+                        # Convert to conversation format: [{"role": "user", "content": text}]
+                        conversations = [[{"role": "user", "content": text}] for text in input_texts]
+                        gen_dp.non_tensor_batch["raw_prompt"] = np.array(conversations, dtype=object)
+            # For async rollout mode, ensure raw_prompt exists (chat_scheduler requires it)
+            if self.async_rollout_mode:
+                if "raw_prompt" not in gen_dp.non_tensor_batch:
+                    # Restore raw_prompt from input_ids if missing
                     # Check if batch exists and has input_ids (TensorDict cannot be used in boolean context)
                     if gen_dp.batch is not None and "input_ids" in gen_dp.batch:
                         input_ids = gen_dp.batch["input_ids"]
@@ -1227,7 +1262,8 @@ class RayPPOTrainer:
             return dp, gen_dp
 
         try:
-            if async_pipeline:
+            # Only AsyncLLM backend needs explicit wake_up/sleep.
+            if async_pipeline and self.async_rollout_mode:
                 self.async_rollout_manager.wake_up()
             
             # Start background rollout generation thread if using buffer
@@ -1284,26 +1320,31 @@ class RayPPOTrainer:
                             if use_buffer:
                                 # Get rollout from buffer (non-blocking)
                                 min_buffer_size = self.config.trainer.get("async_rollout_min_buffer_size", 2)
-                                
+
                                 # Wait for buffer to have enough rollouts
                                 while self.async_rollout_buffer.size() < min_buffer_size:
                                     time.sleep(0.01)  # Small sleep to avoid busy waiting
-                                
+
                                 # Sample rollout from buffer
                                 rollout_samples = self.async_rollout_buffer.sample(batch_size=1)
                                 if len(rollout_samples) == 0:
                                     # Fallback: generate synchronously if buffer is empty
                                     logging.warning("Buffer empty, generating synchronously")
-                                    gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                                    if self.async_rollout_mode:
+                                        # AsyncLLM backend
+                                        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                                    else:
+                                        # Threaded async поверх обычного rollout
+                                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                                 else:
                                     gen_batch_output = rollout_samples[0]['data']
-                                
+
                                 # Add current prompt to queue for background generation
                                 try:
                                     self.prompt_queue.put(gen_batch, timeout=0.1)
                                 except queue.Full:
                                     pass  # Queue is full, skip
-                                
+
                                 # Log buffer statistics periodically
                                 if self.global_steps % 10 == 0:
                                     buffer_stats = self.async_rollout_buffer.get_stats()
@@ -1509,6 +1550,7 @@ class RayPPOTrainer:
                                 actor_output = self.actor_rollout_wg.update_actor(batch)
                             actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                             metrics.update(actor_output_metrics)
+                            
 
                         # Log rollout generations if enabled
                         rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
@@ -1564,7 +1606,7 @@ class RayPPOTrainer:
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
-                    if async_pipeline:
+                    if async_pipeline and self.async_rollout_mode:
                         self.async_rollout_manager.sleep()
                     return
 
@@ -1573,7 +1615,7 @@ class RayPPOTrainer:
             if use_buffer:
                 self._stop_rollout_generation_thread()
             
-            if async_pipeline:
+            if async_pipeline and self.async_rollout_mode:
                 # Best-effort cleanup: offload/discard kv cache after training loop.
                 try:
                     self.async_rollout_manager.sleep()
