@@ -528,6 +528,15 @@ def compute_vtrace_advantage_return(
             shape: (bs, response_length) - V-trace advantages
         returns: `(torch.Tensor)`
             shape: (bs, response_length) - V-trace returns
+        vtrace_stats: `(dict)`
+            Dictionary with V-trace statistics for logging:
+            - "vtrace/c_t_product_mean": mean of cumulative c_t product
+            - "vtrace/c_t_product_min": min of cumulative c_t product
+            - "vtrace/c_t_product_max": max of cumulative c_t product
+            - "vtrace/v_target_mean": mean of V-trace target values
+            - "vtrace/v_target_min": min of V-trace target values
+            - "vtrace/v_target_max": max of V-trace target values
+            - "vtrace/v_target_std": std of V-trace target values
     """
     with torch.no_grad():
         # Ensure gamma is a tensor
@@ -557,30 +566,51 @@ def compute_vtrace_advantage_return(
         gen_len = token_level_rewards.shape[-1]
         v_trace_values = torch.zeros_like(values)
         
+        # Optionally track statistics of cumulative c_t products for debugging / analysis.
+        # We keep this inexpensive: compute per-sequence product over time, then log summary
+        # stats (mean / min / max) once per call.
+        cum_c_prod = None
+
         # Compute V-trace backwards (recursive form)
-        # v_t = V(s_t) + ρ_t * (r_t + γv_{t+1} - V(s_t))
-        # We iterate backwards and use the computed v_{t+1} for the next step
-        # Note: Similar to GAE, we compute for all tokens and apply mask only at the end
+        # Original IMPALA V-trace (Espeholt et al., 2018), Eq. (9):
+        #
+        #   v_s = V(x_s) + Σ_{t=s}^{T-1} γ^{t-s} (∏_{i=s}^{t-1} c_i) ρ_t δ_t
+        #
+        # где:
+        #   δ_t = r_t + γ V(x_{t+1}) - V(x_t)
+        #
+        # Эквивалентная рекурсивная форма:
+        #
+        #   v_t = V(x_t) + ρ_t δ_t + γ c_t (v_{t+1} - V(x_{t+1}))
+        #
+        # Мы реализуем именно эту рекурсивную форму, чтобы корректно
+        # учитывать произведение c_t по времени (через γ c_t (v_{t+1} - V_{t+1})).
+        # Маска применяется в конце, как и в GAE.
         for t in reversed(range(gen_len)):
-            # Get current values
-            v_t = values[:, t]
+            # Get current values / rewards
+            v_t = values[:, t]  # V(x_t)
             r_t = token_level_rewards[:, t]
             rho = rho_t[:, t]
+            c = c_t[:, t]
             
-            # For last timestep, v_next = 0, otherwise use computed v_trace from next step
+            # For next timestep:
+            #   - v_next: baseline V(x_{t+1})
+            #   - v_trace_next: corrected value v_{t+1}
             if t < gen_len - 1:
-                v_next_t = v_trace_values[:, t + 1]
+                v_next = values[:, t + 1]
+                v_trace_next = v_trace_values[:, t + 1]
             else:
-                v_next_t = torch.zeros_like(v_t)
+                v_next = torch.zeros_like(v_t)
+                v_trace_next = torch.zeros_like(v_t)
             
-            # TD error: δ_t = r_t + γv_{t+1} - V(s_t)
-            # Note: We use v_{t+1} (V-trace corrected) instead of V(s_{t+1})
-            delta_t = r_t + gamma * v_next_t - v_t
+            # TD error: δ_t = r_t + γ V(x_{t+1}) - V(x_t)
+            delta_t = r_t + gamma * v_next - v_t
             
-            # V-trace update: v_t = V(s_t) + ρ_t * (r_t + γv_{t+1} - V(s_t))
-            # Softer clipping to allow larger corrections while preventing extreme values
+            # V-trace update (recursive form):
+            #   v_t = V(x_t) + ρ_t δ_t + γ c_t (v_{t+1} - V(x_{t+1}))
+            # Softer clipping on δ_t to allow larger corrections while preventing extremes
             delta_t = torch.clamp(delta_t, min=-50.0, max=50.0)
-            v_trace_t = v_t + rho * delta_t
+            v_trace_t = v_t + rho * delta_t + gamma * c * (v_trace_next - v_next)
             
             # Softer clipping for V-trace values to allow policy learning
             # Still prevent extreme estimates but allow larger range
@@ -588,6 +618,14 @@ def compute_vtrace_advantage_return(
             
             # Store V-trace value (mask will be applied later)
             v_trace_values[:, t] = v_trace_t
+
+            # Track cumulative product of c_t for analysis (forward direction).
+            # Note: we compute it in the backward loop but conceptually this is:
+            #   C_s = ∏_{i=s}^{T-1} c_i
+            if cum_c_prod is None:
+                cum_c_prod = c.clone()
+            else:
+                cum_c_prod = c * cum_c_prod
         
         # Returns are V-trace values
         # Apply mask to returns (similar to GAE - mask is applied after computation)
@@ -602,6 +640,39 @@ def compute_vtrace_advantage_return(
         # This helps stabilize critic learning when V-trace overestimates returns
         returns_mean = verl_F.masked_mean(returns, response_mask)
         returns = returns - returns_mean
+
+        # Compute statistics for logging (c_t product and V-trace values)
+        vtrace_stats = {}
+        
+        # Statistics for cumulative c_t product
+        if cum_c_prod is not None:
+            # Mask out invalid tokens when computing stats
+            c_prod_mask = response_mask[:, 0] if response_mask.ndim == 2 else response_mask
+            # Use absolute to avoid sign issues in case of numerical noise
+            c_prod_mean = verl_F.masked_mean(cum_c_prod.abs(), c_prod_mask)
+            c_prod_min = (cum_c_prod.abs() * c_prod_mask).min()
+            c_prod_max = (cum_c_prod.abs() * c_prod_mask).max()
+            vtrace_stats["vtrace/c_t_product_mean"] = float(c_prod_mean)
+            vtrace_stats["vtrace/c_t_product_min"] = float(c_prod_min)
+            vtrace_stats["vtrace/c_t_product_max"] = float(c_prod_max)
+            # Also keep print for backward compatibility
+            print(
+                "[VTRACE] cumulative c_t product stats "
+                f"(mean={float(c_prod_mean):.4e}, "
+                f"min={float(c_prod_min):.4e}, "
+                f"max={float(c_prod_max):.4e})"
+            )
+        
+        # Statistics for V-trace target values (before normalization)
+        v_trace_masked = v_trace_values * response_mask
+        vtrace_stats["vtrace/v_target_mean"] = float(verl_F.masked_mean(v_trace_masked, response_mask))
+        vtrace_stats["vtrace/v_target_min"] = float((v_trace_masked * response_mask).min())
+        vtrace_stats["vtrace/v_target_max"] = float((v_trace_masked * response_mask).max())
+        # Compute std using masked_var: std = sqrt(var)
+        # Clamp var to non-negative to avoid NaN from sqrt
+        v_trace_var = verl_F.masked_var(v_trace_masked, response_mask)
+        v_trace_var = torch.clamp(v_trace_var, min=0.0)
+        vtrace_stats["vtrace/v_target_std"] = float(torch.sqrt(v_trace_var))
         
         # Advantages = returns - baseline (values)
         advantages = returns - values
@@ -624,7 +695,7 @@ def compute_vtrace_advantage_return(
         # masked_whiten handles the mask internally
         advantages = verl_F.masked_whiten(advantages, response_mask)
     
-    return advantages, returns
+    return advantages, returns, vtrace_stats
 
 
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):

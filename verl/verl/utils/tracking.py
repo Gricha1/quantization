@@ -204,6 +204,7 @@ class ClearMLLogger:
 class CometMLLogger:
     def __init__(self, project_name: str, experiment_name: str, config):
         import comet_ml
+        import os
 
         self.project_name = project_name
         self.experiment_name = experiment_name
@@ -219,6 +220,11 @@ class CometMLLogger:
         # Log config as hyperparameters
         if config is not None:
             self._experiment.log_parameters(_flatten_dict(_transform_params_to_json_serializable(config, convert_list_to_dict=True), sep="/"))
+
+        # Also log TensorBoard directory (if set) so it is visible in Comet.
+        tensorboard_dir = os.environ.get("TENSORBOARD_DIR", None)
+        if tensorboard_dir is not None:
+            self._experiment.log_parameter("tensorboard_dir", tensorboard_dir)
 
     def log(self, data, step):
         import numpy as np

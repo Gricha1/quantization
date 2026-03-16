@@ -84,6 +84,10 @@ pip install "trl<=0.9.6"
 echo "Installing datasets..."
 pip install datasets
 
+# Remove torch-c-dlpack-ext to avoid ABI compatibility issues
+echo "Removing torch-c-dlpack-ext (to avoid ABI compatibility issues)..."
+pip uninstall -y torch-c-dlpack-ext torch_c_dlpack_ext 2>/dev/null || true
+
 echo "=========================================="
 echo "Setup completed successfully!"
 echo "=========================================="

@@ -271,7 +271,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         rho_bar = config.get("vtrace_rho_bar", 1.0) if config else 1.0
         c_bar = config.get("vtrace_c_bar", 1.0) if config else 1.0
         
-        advantages, returns = core_algos.compute_vtrace_advantage_return(
+        advantages, returns, vtrace_stats = core_algos.compute_vtrace_advantage_return(
             token_level_rewards=data.batch["token_level_rewards"],
             values=data.batch["values"],
             response_mask=data.batch["response_mask"],
@@ -283,6 +283,9 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        # Store V-trace statistics in meta_info (not in batch) for later logging
+        # meta_info can contain non-tensor data like dicts with scalars
+        data.meta_info["vtrace_stats"] = vtrace_stats
     else:
         # handle all other adv estimator type other than GAE, GRPO, and VTRACE
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -1534,6 +1537,12 @@ class RayPPOTrainer:
                                 multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
                                 config=self.config.algorithm,
                             )
+                            
+                            # Log V-trace statistics if available (from meta_info, not batch)
+                            if self.config.algorithm.adv_estimator == AdvantageEstimator.VTRACE and "vtrace_stats" in batch.meta_info:
+                                metrics.update(batch.meta_info["vtrace_stats"])
+                                # Clean up after logging
+                                batch.meta_info.pop("vtrace_stats", None)
 
                         # update critic
                         if self.use_critic:

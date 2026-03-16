@@ -57,6 +57,10 @@ python -c "import flash_rl; print('Flash-RL imported successfully')" || {
 # Set JAX to CPU (if needed)
 export JAX_PLATFORMS=cpu
 
+# TensorBoard log directory (per run). This will also be sent to Comet ML.
+export TENSORBOARD_DIR="${TENSORBOARD_DIR:-tensorboard/${RUN_NAME}}"
+mkdir -p "${TENSORBOARD_DIR}"
+
 # Ray temp directory
 export RAY_TEMP_DIR="${RAY_TEMP_DIR:-/tmp/ray_temp}"
 mkdir -p $RAY_TEMP_DIR
@@ -147,7 +151,7 @@ python -m verl.trainer.main_ppo \
   critic.model.fsdp_config.optimizer_offload=False \
   algorithm.use_kl_in_reward=False \
   trainer.critic_warmup=0 \
-  trainer.logger=['console','comet_ml'] \
+  trainer.logger=['console','tensorboard','comet_ml'] \
   trainer.project_name="${project_name}" \
   trainer.experiment_name="${exp_name}" \
   trainer.n_gpus_per_node=2 \
