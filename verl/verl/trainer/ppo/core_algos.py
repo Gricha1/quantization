@@ -22,6 +22,7 @@ __all__ = ['register', "get_adv_estimator_fn", "AdvantageEstimator"]
 
 from collections import defaultdict
 from enum import Enum
+from typing import Optional
 
 import numpy as np
 import torch
@@ -490,6 +491,8 @@ def compute_vtrace_advantage_return(
     gamma: torch.Tensor,
     rho_bar: float = 1.0,
     c_bar: float = 1.0,
+    dones: Optional[torch.Tensor] = None,
+    recurrence: int = 0,
 ):
     """
     Compute V-trace advantage and returns for off-policy correction.
@@ -497,13 +500,32 @@ def compute_vtrace_advantage_return(
     Based on: "IMPALA: Scalable Distributed Deep-RL with Importance Weighted Actor-Learner Architectures"
     https://arxiv.org/abs/1802.01561
     
+    Implementation follows Sample Factory approach:
+    - No clipping on delta_t, v_trace_t, or returns
+    - Advantages computed inside loop: adv = ρ_t * (r_t + γ * v_{t+1} - V_t)
+    - Advantage normalization: same as GAE/PPO — ``verl_F.masked_whiten(advantages, response_mask)``
+    
     V-trace corrects value estimates when using off-policy data by applying truncated importance sampling.
     
     Mathematical formulation:
         ρ_t = min(ρ̄, π(a_t|s_t) / μ(a_t|s_t))
         c_t = min(c̄, π(a_t|s_t) / μ(a_t|s_t))
         δ_t = r_t + γV(s_{t+1}) - V(s_t)
-        v_t = V(s_t) + ρ_t * (r_t + γv_{t+1} - V(s_t))
+        v_t = V(s_t) + ρ_t δ_t + γ c_t (v_{t+1} - V(s_{t+1}))
+        adv_t = ρ_t * (r_t + γ * v_{t+1} - V_t)
+    
+    Done flags handling (implemented):
+       - If 'dones' parameter is provided, uses: not_done_gamma = (1.0 - dones) * gamma
+       - This means if done=True, gamma is multiplied by 0 (no future rewards)
+       - Matches Sample Factory implementation
+    
+    Potential future improvements (matching Sample Factory more closely):
+    
+    4) Trajectory segmentation:
+       - Sample Factory uses fixed-length segments (recurrence parameter)
+       - Current VERL: processes full sequences
+       - Proposal: Add optional 'recurrence' parameter to process sequences in segments
+         This would require restructuring the loop to handle segments of fixed length
     
     Args:
         token_level_rewards: `(torch.Tensor)`
@@ -522,6 +544,14 @@ def compute_vtrace_advantage_return(
             truncation threshold for importance weights (default: 1.0)
         c_bar: `(float)`
             truncation threshold for c weights (default: 1.0, should be <= rho_bar)
+        dones: `(torch.Tensor, optional)`
+            shape: (bs, response_length) - done flags indicating episode termination
+            If provided, uses not_done_gamma = (1.0 - dones) * gamma to handle episode boundaries
+            When done=True, future rewards are not discounted (gamma becomes 0)
+        recurrence: `(int, optional)`
+            V-trace segmentation length (Sample Factory-style recurrence). 0 disables segmentation and uses the full
+            trajectory. When > 0, V-trace is computed within segments of length `recurrence` with bootstrap at segment
+            boundaries so that corrections do not propagate across segments.
     
     Returns:
         advantages: `(torch.Tensor)`
@@ -544,16 +574,15 @@ def compute_vtrace_advantage_return(
             gamma = torch.tensor(gamma, device=values.device, dtype=values.dtype)
         
         # Compute importance ratios: π(a_t|s_t) / μ(a_t|s_t) = exp(log π - log μ)
+        # Match Sample Factory (learner.py): clamp ratio only (no log clamp there)
         log_ratio = old_log_probs - rollout_log_probs
-        # Clip log_ratio to prevent numerical instability
-        # Softer clipping to allow policy changes while preventing extreme values
-        log_ratio = torch.clamp(log_ratio, min=-10.0, max=10.0)
         importance_ratio = torch.exp(log_ratio)
-        
+        importance_ratio = torch.clamp(importance_ratio, min=0.05, max=20.0)
+
         # Truncated importance weights
         rho_t = torch.clamp(importance_ratio, max=rho_bar)
         c_t = torch.clamp(importance_ratio, max=c_bar)
-        
+
         # Softer bounds: allow rho_t to be smaller (down to 0.01) to allow policy changes
         # Only cap maximum if rho_bar is too high
         if rho_bar > 2.0:
@@ -562,14 +591,31 @@ def compute_vtrace_advantage_return(
             # Allow rho_t to be as small as needed (down to 0.01) for policy changes
             rho_t = torch.clamp(rho_t, min=0.01)
         
-        # Initialize V-trace values
+        # Initialize V-trace values and advantages
         gen_len = token_level_rewards.shape[-1]
         v_trace_values = torch.zeros_like(values)
+        advantages = torch.zeros_like(values)
         
         # Optionally track statistics of cumulative c_t products for debugging / analysis.
         # We keep this inexpensive: compute per-sequence product over time, then log summary
         # stats (mean / min / max) once per call.
         cum_c_prod = None
+        seg_c_prod_list = []  # list[Tensor(bs,)] cumulative c_t products per segment
+        
+        # Handle done flags (matching Sample Factory)
+        # If dones is provided, use not_done_gamma = (1.0 - dones) * gamma
+        # This ensures that when done=True, future rewards are not discounted (gamma becomes 0)
+        if dones is not None:
+            # Ensure dones has the same shape as values
+            if dones.shape != values.shape:
+                raise ValueError(f"dones shape {dones.shape} must match values shape {values.shape}")
+            # Convert to float if needed
+            if dones.dtype != torch.float32 and dones.dtype != torch.float64:
+                dones = dones.float()
+            not_done = 1.0 - dones
+            # not_done_gamma will be computed per timestep in the loop
+        else:
+            not_done = None
 
         # Compute V-trace backwards (recursive form)
         # Original IMPALA V-trace (Espeholt et al., 2018), Eq. (9):
@@ -586,60 +632,97 @@ def compute_vtrace_advantage_return(
         # Мы реализуем именно эту рекурсивную форму, чтобы корректно
         # учитывать произведение c_t по времени (через γ c_t (v_{t+1} - V_{t+1})).
         # Маска применяется в конце, как и в GAE.
-        for t in reversed(range(gen_len)):
-            # Get current values / rewards
-            v_t = values[:, t]  # V(x_t)
-            r_t = token_level_rewards[:, t]
-            rho = rho_t[:, t]
-            c = c_t[:, t]
-            
-            # For next timestep:
-            #   - v_next: baseline V(x_{t+1})
-            #   - v_trace_next: corrected value v_{t+1}
-            if t < gen_len - 1:
-                v_next = values[:, t + 1]
-                v_trace_next = v_trace_values[:, t + 1]
-            else:
-                v_next = torch.zeros_like(v_t)
-                v_trace_next = torch.zeros_like(v_t)
-            
-            # TD error: δ_t = r_t + γ V(x_{t+1}) - V(x_t)
-            delta_t = r_t + gamma * v_next - v_t
-            
-            # V-trace update (recursive form):
-            #   v_t = V(x_t) + ρ_t δ_t + γ c_t (v_{t+1} - V(x_{t+1}))
-            # Softer clipping on δ_t to allow larger corrections while preventing extremes
-            delta_t = torch.clamp(delta_t, min=-50.0, max=50.0)
-            v_trace_t = v_t + rho * delta_t + gamma * c * (v_trace_next - v_next)
-            
-            # Softer clipping for V-trace values to allow policy learning
-            # Still prevent extreme estimates but allow larger range
-            v_trace_t = torch.clamp(v_trace_t, min=-100.0, max=100.0)
-            
-            # Store V-trace value (mask will be applied later)
-            v_trace_values[:, t] = v_trace_t
+        # 
+        # Following Sample Factory implementation:
+        # - No clipping on delta_t or v_trace_t (removed for closer match to Sample Factory)
+        # - Advantages computed inside loop: adv = ρ_t * (r_t + γ * v_{t+1} - V_t)
+        # - Done flags handling: not_done_gamma = (1.0 - dones) * gamma
+        def _process_range(t_start: int, t_end: int) -> None:
+            """Compute V-trace within [t_start, t_end) (t_end exclusive).
 
-            # Track cumulative product of c_t for analysis (forward direction).
-            # Note: we compute it in the backward loop but conceptually this is:
-            #   C_s = ∏_{i=s}^{T-1} c_i
-            if cum_c_prod is None:
-                cum_c_prod = c.clone()
-            else:
-                cum_c_prod = c * cum_c_prod
-        
+            For recurrence-style segmentation, we bootstrap at the segment boundary by setting:
+                v_{t_end} = V(x_{t_end})
+            which makes (v_{t_end} - V(x_{t_end})) = 0 and prevents corrections from propagating across segments.
+            """
+            if t_end < gen_len:
+                v_trace_values[:, t_end] = values[:, t_end]
+
+            seg_cum_c_prod = None  # per-segment cumulative c_t product (per sequence in batch)
+            for t in reversed(range(t_start, t_end)):
+                # Get current values / rewards
+                v_t = values[:, t]  # V(x_t)
+                r_t = token_level_rewards[:, t]
+                rho = rho_t[:, t]
+                c = c_t[:, t]
+
+                # Compute not_done_gamma if dones are provided (matching Sample Factory)
+                if not_done is not None:
+                    not_done_gamma = not_done[:, t] * gamma
+                else:
+                    not_done_gamma = gamma
+
+                # For next timestep:
+                #   - v_next: baseline V(x_{t+1})
+                #   - v_trace_next: corrected value v_{t+1}
+                if t < gen_len - 1:
+                    v_next = values[:, t + 1]
+                    v_trace_next = v_trace_values[:, t + 1]
+                else:
+                    v_next = torch.zeros_like(v_t)
+                    v_trace_next = torch.zeros_like(v_t)
+
+                # TD error: δ_t = r_t + γ V(x_{t+1}) - V(x_t)
+                # Use not_done_gamma if dones are provided
+                delta_t = r_t + not_done_gamma * v_next - v_t
+
+                # V-trace update (recursive form):
+                #   v_t = V(x_t) + ρ_t δ_t + γ c_t (v_{t+1} - V(x_{t+1}))
+                # Use not_done_gamma if dones are provided (matching Sample Factory)
+                # No clipping (matching Sample Factory implementation)
+                v_trace_t = v_t + rho * delta_t + not_done_gamma * c * (v_trace_next - v_next)
+
+                # Store V-trace value (mask will be applied later)
+                v_trace_values[:, t] = v_trace_t
+
+                # Compute advantage inside loop (matching Sample Factory):
+                #   adv = ρ_t * (r_t + γ * v_{t+1} - V_t)
+                # Use not_done_gamma if dones are provided
+                # This uses the corrected v_{t+1} (v_trace_next) instead of V_{t+1}
+                advantages[:, t] = rho * (r_t + not_done_gamma * v_trace_next - v_t)
+
+                # Track cumulative product of c_t for analysis (forward direction).
+                # Note: we compute it in the backward loop but conceptually this is:
+                #   C_s = ∏_{i=s}^{T-1} c_i
+                nonlocal cum_c_prod
+                if cum_c_prod is None:
+                    cum_c_prod = c.clone()
+                else:
+                    cum_c_prod = c * cum_c_prod
+
+                # Track per-segment cumulative product as well
+                if seg_cum_c_prod is None:
+                    seg_cum_c_prod = c.clone()
+                else:
+                    seg_cum_c_prod = c * seg_cum_c_prod
+
+            # Save per-segment product (one value per sequence in batch)
+            if seg_cum_c_prod is not None:
+                seg_c_prod_list.append(seg_cum_c_prod)
+
+        # Process either full trajectory or segmented ranges (recurrence)
+        rec = int(recurrence) if recurrence is not None else 0
+        if rec <= 0 or rec >= gen_len:
+            _process_range(0, gen_len)
+        else:
+            for seg_end in range(gen_len, 0, -rec):
+                seg_start = max(0, seg_end - rec)
+                _process_range(seg_start, seg_end)
+
         # Returns are V-trace values
         # Apply mask to returns (similar to GAE - mask is applied after computation)
         returns = v_trace_values * response_mask + values * (1 - response_mask)
         
-        # Softer clipping for returns to allow policy learning
-        # Still prevent extreme values but allow larger range for critic learning
-        returns = torch.clamp(returns, min=-100.0, max=100.0)
-        
-        # Normalize returns to prevent critic overestimation
-        # This centers returns around their mean, similar to how GAE normalizes advantages
-        # This helps stabilize critic learning when V-trace overestimates returns
-        returns_mean = verl_F.masked_mean(returns, response_mask)
-        returns = returns - returns_mean
+        # No clipping on returns (matching Sample Factory implementation)
 
         # Compute statistics for logging (c_t product and V-trace values)
         vtrace_stats = {}
@@ -662,6 +745,22 @@ def compute_vtrace_advantage_return(
                 f"min={float(c_prod_min):.4e}, "
                 f"max={float(c_prod_max):.4e})"
             )
+
+        # Statistics for per-segment cumulative c_t products (only meaningful when recurrence > 0).
+        # We log aggregated stats across segments to avoid spamming Comet with per-segment time series.
+        if len(seg_c_prod_list) > 0:
+            # Stack: (n_segments, bs)
+            seg_c_prod = torch.stack(seg_c_prod_list, dim=0).abs()
+
+            # Batch mask: keep sequences that have any valid token in the response (simple proxy)
+            batch_mask = response_mask[:, 0] if response_mask.ndim == 2 else response_mask
+            batch_mask = batch_mask.to(dtype=seg_c_prod.dtype)
+
+            # Mean per segment over batch (masked), then aggregate across segments
+            seg_mean_over_batch = (seg_c_prod * batch_mask.unsqueeze(0)).sum(dim=1) / (batch_mask.sum() + 1e-8)
+            vtrace_stats["vtrace/seg_c_t_product_mean_mean"] = float(seg_mean_over_batch.mean())
+            vtrace_stats["vtrace/seg_c_t_product_mean_min"] = float(seg_mean_over_batch.min())
+            vtrace_stats["vtrace/seg_c_t_product_mean_max"] = float(seg_mean_over_batch.max())
         
         # Statistics for V-trace target values (before normalization)
         v_trace_masked = v_trace_values * response_mask
@@ -674,16 +773,12 @@ def compute_vtrace_advantage_return(
         v_trace_var = torch.clamp(v_trace_var, min=0.0)
         vtrace_stats["vtrace/v_target_std"] = float(torch.sqrt(v_trace_var))
         
-        # Advantages = returns - baseline (values)
-        advantages = returns - values
-        
+        # Advantages are already computed inside the loop (matching Sample Factory)
         # Apply mask to advantages (zero out invalid tokens)
         advantages = advantages * response_mask
         
         # Check for NaN or Inf before normalization
         if torch.any(torch.isnan(advantages)) or torch.any(torch.isinf(advantages)):
-            # Fallback: use simple advantages without V-trace correction
-            advantages = (v_trace_values - values) * response_mask
             # Replace NaN/Inf with zeros
             advantages = torch.where(
                 torch.isnan(advantages) | torch.isinf(advantages),
@@ -691,9 +786,11 @@ def compute_vtrace_advantage_return(
                 advantages
             )
         
-        # Normalize advantages (similar to GAE)
-        # masked_whiten handles the mask internally
-        advantages = verl_F.masked_whiten(advantages, response_mask)
+        # Normalize advantages like GAE/PPO (compute_gae_advantage_return)
+        if response_mask.any():
+            advantages = verl_F.masked_whiten(advantages, response_mask)
+        else:
+            advantages = torch.zeros_like(advantages)
     
     return advantages, returns, vtrace_stats
 

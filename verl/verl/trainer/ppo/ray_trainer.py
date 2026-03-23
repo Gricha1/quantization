@@ -270,6 +270,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         # Get V-trace parameters from config
         rho_bar = config.get("vtrace_rho_bar", 1.0) if config else 1.0
         c_bar = config.get("vtrace_c_bar", 1.0) if config else 1.0
+        recurrence = config.get("vtrace_recurrence", 0) if config else 0
         
         advantages, returns, vtrace_stats = core_algos.compute_vtrace_advantage_return(
             token_level_rewards=data.batch["token_level_rewards"],
@@ -280,6 +281,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             gamma=gamma,
             rho_bar=rho_bar,
             c_bar=c_bar,
+            recurrence=recurrence,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns

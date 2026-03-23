@@ -1,30 +1,27 @@
 #!/bin/bash
 # PPO training script with V-trace and Flash-RL quantization on 8k math dataset
-# Usage: bash run_vtrace_ppo_math8k_quantized.sh [RUN_NAME] [QUANTIZATION_TYPE] [FP32_LM_HEAD] [RHO_BAR] [C_BAR]
-# RUN_NAME: experiment name (default: auto-generated)
-# QUANTIZATION_TYPE: fp8 or int8 (default: fp8)
-# FP32_LM_HEAD: use FP32 for LM head, 0 or 1 (default: 0)
-# RHO_BAR: V-trace rho truncation threshold (default: 0.8, more conservative)
-# C_BAR: V-trace c truncation threshold (default: 0.8, more conservative)
+# Usage: bash run_vtrace_ppo_math8k_quantized.sh [RECURRENCE] [C_BAR] [RHO_BAR]
+# RECURRENCE: V-trace segmentation length (default: 0 = disabled, full trajectory)
+# C_BAR: V-trace c truncation threshold (default: 0.8)
+# RHO_BAR: V-trace rho truncation threshold (default: 0.8)
 
 set -e
 
 # Parse arguments
-RUN_NAME=${1:-""}
-QUANTIZATION_TYPE=${2:-"fp8"}
-FP32_LM_HEAD=${3:-"0"}
-RHO_BAR=${4:-"0.8"}
-C_BAR=${5:-"0.8"}
+RECURRENCE=${1:-"0"}
+C_BAR=${2:-"0.8"}
+RHO_BAR=${3:-"0.8"}
 
-# If RUN_NAME is empty, generate one
-if [ -z "$RUN_NAME" ]; then
-    RUN_NAME="ppo_vtrace_math8k_${QUANTIZATION_TYPE}_Qwen2.5-32B_$(date +%Y%m%d-%H%M%S)"
-fi
+# Fixed defaults (edit here if needed)
+QUANTIZATION_TYPE="fp8"
+FP32_LM_HEAD="0"
 
-# Validate quantization type
+# Auto-generate RUN_NAME
+RUN_NAME="ppo_vtrace_math8k_${QUANTIZATION_TYPE}_Qwen2.5-32B_$(date +%Y%m%d-%H%M%S)"
+
+# Quantization type is fixed above; keep a sanity check anyway
 if [[ ! "$QUANTIZATION_TYPE" =~ ^(fp8|int8)$ ]]; then
     echo "ERROR: Invalid QUANTIZATION_TYPE='$QUANTIZATION_TYPE'. Must be one of: fp8, int8"
-    echo "Usage: bash $0 [RUN_NAME] [QUANTIZATION_TYPE] [FP32_LM_HEAD] [RHO_BAR] [C_BAR]"
     exit 1
 fi
 
@@ -74,6 +71,7 @@ echo "Model: $MODEL_NAME"
 echo "FP32 LM Head: $FP32_LM_HEAD"
 echo "V-trace rho_bar: $RHO_BAR"
 echo "V-trace c_bar: $C_BAR"
+echo "V-trace recurrence: $RECURRENCE"
 echo "FLASHRL_CONFIG: $FLASHRL_CONFIG"
 echo "=========================================="
 
@@ -121,6 +119,7 @@ python -m verl.trainer.main_ppo \
   algorithm.adv_estimator=vtrace \
   algorithm.vtrace_rho_bar=${RHO_BAR} \
   algorithm.vtrace_c_bar=${C_BAR} \
+  algorithm.vtrace_recurrence=${RECURRENCE} \
   data.train_files=$TRAIN_DATA_PATH \
   data.val_files=$VAL_DATA_PATH \
   data.train_batch_size=$train_data_size \
@@ -157,11 +156,11 @@ python -m verl.trainer.main_ppo \
   trainer.n_gpus_per_node=2 \
   trainer.val_before_train=True \
   trainer.nnodes=1 \
-  actor_rollout_ref.actor.imp_ratio_cap=-1 \
+  actor_rollout_ref.actor.imp_ratio_cap=5 \
   trainer.save_freq=20 \
   trainer.test_freq=10 \
   trainer.log_val_generations=10 \
-  trainer.total_epochs=30 \
+  trainer.total_epochs=512 \
   trainer.max_actor_ckpt_to_keep=1 \
   trainer.max_critic_ckpt_to_keep=1 \
   2>&1 | tee ${RUN_NAME}.log

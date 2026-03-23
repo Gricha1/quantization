@@ -756,6 +756,11 @@ algorithm:
   # Lower values reduce variance but may introduce bias
   vtrace_c_bar: 0.8
 
+  # V-trace segmentation length (recurrence). 0 disables segmentation (uses full trajectory).
+  # When > 0, V-trace is computed within segments of length `vtrace_recurrence` with bootstrap at segment boundaries,
+  # similar to Sample Factory's recurrence-based V-trace.
+  vtrace_recurrence: 0
+
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
 
