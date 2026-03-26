@@ -1,16 +1,20 @@
 #!/bin/bash
 # PPO training script with V-trace and Flash-RL quantization on 8k math dataset
-# Usage: bash run_vtrace_ppo_math8k_quantized.sh [RECURRENCE] [C_BAR] [RHO_BAR]
+# Usage: bash run_vtrace_ppo_math8k_quantized.sh [RECURRENCE] [C_BAR] [RHO_BAR] [RESUME_HINT]
 # RECURRENCE: V-trace segmentation length (default: 0 = disabled, full trajectory)
 # C_BAR: V-trace c truncation threshold (default: 0.8)
 # RHO_BAR: V-trace rho truncation threshold (default: 0.8)
+# RESUME_HINT: optional tensorboard/checkpoints run path or run name for resume.
+#              By default (empty), training starts from scratch.
+#              Use "none" / "disable" / "off" to force disable resume.
 
 set -e
 
 # Parse arguments
-RECURRENCE=${1:-"0"}
-C_BAR=${2:-"0.8"}
-RHO_BAR=${3:-"0.8"}
+RECURRENCE=${1:-"32"}
+C_BAR=${2:-"1.0"}
+RHO_BAR=${3:-"1.0"}
+RESUME_HINT=${4:-""}
 
 # Fixed defaults (edit here if needed)
 QUANTIZATION_TYPE="fp8"
@@ -18,6 +22,57 @@ FP32_LM_HEAD="0"
 
 # Auto-generate RUN_NAME
 RUN_NAME="ppo_vtrace_math8k_${QUANTIZATION_TYPE}_Qwen2.5-32B_$(date +%Y%m%d-%H%M%S)"
+
+# Resolve optional resume checkpoint (oldest global_step_* in run directory)
+RESUME_ARGS=()
+RESUME_HINT_LOWER="$(echo "$RESUME_HINT" | tr '[:upper:]' '[:lower:]')"
+if [ -z "$RESUME_HINT" ]; then
+    echo "Resume disabled: starting from scratch (no RESUME_HINT provided)"
+elif [ "$RESUME_HINT_LOWER" = "none" ] || [ "$RESUME_HINT_LOWER" = "disable" ] || [ "$RESUME_HINT_LOWER" = "off" ]; then
+    echo "Resume explicitly disabled by RESUME_HINT='$RESUME_HINT'"
+else
+    RESUME_CANDIDATES=()
+    if [ -d "$RESUME_HINT" ]; then
+        RESUME_CANDIDATES+=("$RESUME_HINT")
+    fi
+
+    RESUME_BASENAME="$(basename "$RESUME_HINT")"
+    if [ -d "tensorboard/$RESUME_BASENAME" ]; then
+        RESUME_CANDIDATES+=("tensorboard/$RESUME_BASENAME")
+    fi
+    if [ -d "checkpoints/flash_rl_math8k/$RESUME_BASENAME" ]; then
+        RESUME_CANDIDATES+=("checkpoints/flash_rl_math8k/$RESUME_BASENAME")
+    fi
+    if [ -d "$RESUME_BASENAME" ]; then
+        RESUME_CANDIDATES+=("$RESUME_BASENAME")
+    fi
+
+    # Prefer checkpoints paths if both tensorboard/checkpoints are present.
+    RESUME_RUN_DIR=""
+    for candidate in "${RESUME_CANDIDATES[@]}"; do
+        if [ -d "$candidate/global_step_1" ] || ls "$candidate"/global_step_* >/dev/null 2>&1; then
+            RESUME_RUN_DIR="$candidate"
+            break
+        fi
+    done
+    if [ -z "$RESUME_RUN_DIR" ] && [ -d "checkpoints/flash_rl_math8k/$RESUME_BASENAME" ]; then
+        RESUME_RUN_DIR="checkpoints/flash_rl_math8k/$RESUME_BASENAME"
+    fi
+
+    if [ -n "$RESUME_RUN_DIR" ] && ls "$RESUME_RUN_DIR"/global_step_* >/dev/null 2>&1; then
+        RESUME_PATH="$(ls -d "$RESUME_RUN_DIR"/global_step_* | sed 's#/$##' | sort -t_ -k3,3n | head -n1)"
+        if [ -n "$RESUME_PATH" ]; then
+            RESUME_ARGS+=("trainer.resume_mode=resume_path")
+            RESUME_ARGS+=("trainer.resume_from_path=$RESUME_PATH")
+            echo "Resume enabled:"
+            echo "  hint: $RESUME_HINT"
+            echo "  run dir: $RESUME_RUN_DIR"
+            echo "  oldest checkpoint: $RESUME_PATH"
+        fi
+    else
+        echo "Resume disabled: no checkpoint run directory found for hint '$RESUME_HINT'"
+    fi
+fi
 
 # Quantization type is fixed above; keep a sanity check anyway
 if [[ ! "$QUANTIZATION_TYPE" =~ ^(fp8|int8)$ ]]; then
@@ -141,6 +196,9 @@ python -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.gpu_memory_utilization=0.55 \
   actor_rollout_ref.rollout.disable_log_stats=False \
+  actor_rollout_ref.actor.clip_ratio=0.1 \
+  actor_rollout_ref.actor.clip_ratio_low=0.1 \
+  actor_rollout_ref.actor.clip_ratio_high=0.1 \
   critic.optim.lr=1e-5 \
   critic.model.use_remove_padding=False \
   critic.model.path=$MODEL_NAME \
@@ -156,13 +214,14 @@ python -m verl.trainer.main_ppo \
   trainer.n_gpus_per_node=2 \
   trainer.val_before_train=True \
   trainer.nnodes=1 \
-  actor_rollout_ref.actor.imp_ratio_cap=5 \
+  actor_rollout_ref.actor.imp_ratio_cap=5.0 \
   trainer.save_freq=20 \
   trainer.test_freq=10 \
   trainer.log_val_generations=10 \
   trainer.total_epochs=512 \
   trainer.max_actor_ckpt_to_keep=1 \
   trainer.max_critic_ckpt_to_keep=1 \
+  "${RESUME_ARGS[@]}" \
   2>&1 | tee ${RUN_NAME}.log
 
 echo "Training completed!"
