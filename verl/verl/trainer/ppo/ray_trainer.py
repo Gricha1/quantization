@@ -271,7 +271,19 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         rho_bar = config.get("vtrace_rho_bar", 1.0) if config else 1.0
         c_bar = config.get("vtrace_c_bar", 1.0) if config else 1.0
         recurrence = config.get("vtrace_recurrence", 0) if config else 0
-        
+
+        disable_pad_bootstrap = (
+            config.get("vtrace_disable_bootstrap_through_padding", False) if config else False
+        )
+        dones = None
+        if disable_pad_bootstrap:
+            values_dtype = data.batch["values"].dtype
+            response_mask = data.batch["response_mask"].to(dtype=values_dtype)
+            not_done_next = torch.cat(
+                [response_mask[:, 1:], torch.zeros_like(response_mask[:, :1])], dim=1
+            )
+            dones = (1.0 - not_done_next).to(dtype=values_dtype)
+
         advantages, returns, vtrace_stats = core_algos.compute_vtrace_advantage_return(
             token_level_rewards=data.batch["token_level_rewards"],
             values=data.batch["values"],
@@ -281,6 +293,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             gamma=gamma,
             rho_bar=rho_bar,
             c_bar=c_bar,
+            dones=dones,
             recurrence=recurrence,
         )
         data.batch["advantages"] = advantages

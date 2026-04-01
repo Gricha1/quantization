@@ -11,9 +11,9 @@
 set -e
 
 # Parse arguments
-RECURRENCE=${1:-"32"}
-C_BAR=${2:-"1.0"}
-RHO_BAR=${3:-"1.0"}
+RECURRENCE=${1:-"64"}
+C_BAR=${2:-"0.5"}
+RHO_BAR=${3:-"0.5"}
 RESUME_HINT=${4:-""}
 
 # Fixed defaults (edit here if needed)
@@ -170,6 +170,7 @@ echo "  Train: $TRAIN_DATA_PATH"
 echo "  Val: $VAL_DATA_PATH"
 
 # Run PPO training with V-trace and quantization
+# Optional: algorithm.vtrace_disable_bootstrap_through_padding=True — do not bootstrap V-trace through <pad> after EOS.
 python -m verl.trainer.main_ppo \
   algorithm.adv_estimator=vtrace \
   algorithm.vtrace_rho_bar=${RHO_BAR} \
@@ -184,7 +185,7 @@ python -m verl.trainer.main_ppo \
   data.filter_overlong_prompts=True \
   data.truncation='error' \
   actor_rollout_ref.model.path=$MODEL_NAME \
-  actor_rollout_ref.actor.optim.lr=1e-6 \
+  actor_rollout_ref.actor.optim.lr=2e-7 \
   actor_rollout_ref.model.use_remove_padding=False \
   actor_rollout_ref.actor.ppo_mini_batch_size=64 \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
@@ -196,9 +197,7 @@ python -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.gpu_memory_utilization=0.55 \
   actor_rollout_ref.rollout.disable_log_stats=False \
-  actor_rollout_ref.actor.clip_ratio=0.1 \
-  actor_rollout_ref.actor.clip_ratio_low=0.1 \
-  actor_rollout_ref.actor.clip_ratio_high=0.1 \
+  actor_rollout_ref.rollout.temperature=0.7 \
   critic.optim.lr=1e-5 \
   critic.model.use_remove_padding=False \
   critic.model.path=$MODEL_NAME \
@@ -208,7 +207,7 @@ python -m verl.trainer.main_ppo \
   critic.model.fsdp_config.optimizer_offload=False \
   algorithm.use_kl_in_reward=False \
   trainer.critic_warmup=0 \
-  trainer.logger=['console','tensorboard','comet_ml'] \
+  trainer.logger='[console,tensorboard,comet_ml]' \
   trainer.project_name="${project_name}" \
   trainer.experiment_name="${exp_name}" \
   trainer.n_gpus_per_node=2 \

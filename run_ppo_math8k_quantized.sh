@@ -139,7 +139,7 @@ python -m verl.trainer.main_ppo \
   critic.model.fsdp_config.optimizer_offload=False \
   algorithm.use_kl_in_reward=False \
   trainer.critic_warmup=0 \
-  trainer.logger=['console','comet_ml'] \
+  trainer.logger='[console,tensorboard,comet_ml]' \
   trainer.project_name="${project_name}" \
   trainer.experiment_name="${exp_name}" \
   trainer.n_gpus_per_node=2 \

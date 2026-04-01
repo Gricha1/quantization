@@ -761,6 +761,11 @@ algorithm:
   # similar to Sample Factory's recurrence-based V-trace.
   vtrace_recurrence: 0
 
+  # If True, treat the first padding position after the last valid response token as terminal for V-trace:
+  # gamma is zeroed across the EOS/pad boundary so targets/advantages do not bootstrap through padded timesteps.
+  # Default False preserves the previous behavior (no explicit per-step dones; bootstrap can flow through pad slots).
+  vtrace_disable_bootstrap_through_padding: False
+
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
 
